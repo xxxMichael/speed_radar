@@ -1,6 +1,4 @@
-#carpeta data 
 data/
-# Entornos virtuales de Python
 venv/
 .venv/
 env/

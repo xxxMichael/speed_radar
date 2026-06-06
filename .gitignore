@@ -1,0 +1,11 @@
+#carpeta data 
+data/
+# Entornos virtuales de Python
+venv/
+.venv/
+env/
+.env/
+
+__pycache__/
+*.py[cod]
+*$py.class

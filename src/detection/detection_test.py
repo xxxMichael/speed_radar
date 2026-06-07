@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from detection.vehicle_tracker import VehicleTracker
 from detection.speed_calculator import SpeedCalculator
 from ocr.plate_ocr import PlateOCR
+from fuzzy.fine_system import FineSystem
+from notifications.email_sender import send_infraction_email
 
 
 # =============================================================================
@@ -39,7 +41,7 @@ SPEED_LIMIT_STEP   = 5.0        # Cuanto cambia el limite con cada pulsacion
 REAL_DISTANCE_M    = 5.0        # Distancia real inicial entre lineas (ajustable con + y -)
 REAL_DISTANCE_STEP = 0.5
 
-YOLO_CONF          = 0.15       # Umbral de confianza YOLO
+YOLO_CONF          = 0.30       # Umbral de confianza YOLO (subido de 0.15 para estabilizar tracking)
 
 WINDOW_NAME        = "Speed Radar - Deteccion (Q=salir)"
 # =============================================================================
@@ -97,10 +99,17 @@ class InteractiveSpeedTest:
 
         # --- OCR de placas ---
         self.plate_ocr: PlateOCR | None = None   # Se inicializa en run()
-        # Placas ya leidas: {track_id: plate_str}
+        # Placa final (ganadora por votacion): {track_id: plate_str}
         self.plates: dict[int, str] = {}
+        # Votos acumulados por vehiculo: {track_id: {plate_str: count}}
+        self._plate_votes: dict[int, dict[str, int]] = {}
         # Set de track_ids cuyo OCR ya esta corriendo en hilo (evita duplicados)
         self._ocr_running: set[int] = set()
+        # Ultimo tiempo de escaneo por vehiculo (para reintentos dinamicos)
+        self._last_ocr_time: dict[int, float] = {}
+
+        # --- Sistema Difuso de Multas ---
+        self.fine_system = FineSystem()
 
     # ------------------------------------------------------------------
     # OCR de placas (hilo en segundo plano)
@@ -125,14 +134,102 @@ class InteractiveSpeedTest:
         finally:
             self._ocr_running.discard(tid)
 
-        plate_str = plate if plate else '???'
+        # Registrar voto y obtener placa ganadora por votacion
+        plate_str = self._vote_plate(tid, plate if plate else '')
         self.plates[tid] = plate_str
         ts = time.strftime("%H:%M:%S")
 
+        # Actualizar en el log de infracciones de la interfaz
+        for inf in self.infraction_log:
+            if inf['id'] == tid and inf['plate'] == '...':
+                inf['plate'] = plate_str
+
         if speed > self.speed_limit_kmh:
-            print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h")
+            # Calcular la multa usando el sistema difuso Mamdani
+            fine_amount = self.fine_system.calculate_fine(speed, self.speed_limit_kmh)
+            
+            print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Multa Difusa: ${fine_amount:.2f} USD")
+            
+            # Recortar la imagen del vehículo para enviarla como evidencia
+            try:
+                h, w = frame_copy.shape[:2]
+                x1, y1, x2, y2 = bbox
+                # Asegurar límites dentro del frame
+                x1, y1 = max(0, int(x1)), max(0, int(y1))
+                x2, y2 = min(w, int(x2)), min(h, int(y2))
+                
+                if x2 > x1 and y2 > y1:
+                    vehicle_crop = frame_copy[y1:y2, x1:x2]
+                else:
+                    vehicle_crop = None
+            except Exception as e:
+                vehicle_crop = None
+                print(f"[WARNING] No se pudo recortar la evidencia para vehiculo #{tid}: {e}")
+            
+            # Disparar correo asíncrono
+            send_infraction_email(
+                vehicle_id=tid,
+                plate=plate_str,
+                speed=speed,
+                speed_limit=self.speed_limit_kmh,
+                fine_amount=fine_amount,
+                frame_crop=vehicle_crop
+            )
         else:
             print(f"[REGISTRO]   {ts} | Vehiculo #{tid} | Placa: {plate_str}")
+
+    def _vote_plate(self, tid: int, plate: str) -> str:
+        """
+        Acumula votos de lecturas de placa y retorna la placa ganadora.
+        Prefiere placas con formato ecuatoriano valido (7 chars con guion).
+        """
+        import re
+        if tid not in self._plate_votes:
+            self._plate_votes[tid] = {}
+
+        if plate and plate != '???':
+            votes = self._plate_votes[tid]
+            votes[plate] = votes.get(plate, 0) + 1
+
+        # Ordenar por votos, priorizando placas con formato AAA-NNNN
+        pattern = re.compile(r'^[A-Z]{3}-\d{4}$')
+        all_votes = self._plate_votes.get(tid, {})
+        if not all_votes:
+            return '???'
+
+        # Primero buscar entre las que cumplen el formato
+        valid = {p: v for p, v in all_votes.items() if pattern.match(p)}
+        if valid:
+            return max(valid, key=valid.get)
+
+        # Si ninguna cumple el formato, devolver la mas votada con al menos 4 chars
+        long_plates = {p: v for p, v in all_votes.items() if len(p) >= 4}
+        if long_plates:
+            return max(long_plates, key=long_plates.get)
+
+        return max(all_votes, key=all_votes.get)
+
+    def _run_ocr_continuous_async(self, tid: int, frame_copy: 'np.ndarray', bbox: list):
+        """
+        Ejecuta el OCR de forma continua/dinamica para un vehiculo en pantalla.
+        Acumula votos y actualiza la placa ganadora.
+        """
+        try:
+            plate, _ = self.plate_ocr.read_plate(frame_copy, bbox)
+        except Exception as e:
+            plate = ''
+        finally:
+            self._ocr_running.discard(tid)
+
+        # Registrar voto y obtener ganadora
+        winner = self._vote_plate(tid, plate)
+        old    = self.plates.get(tid, '???')
+
+        if winner != old:
+            self.plates[tid] = winner
+            ts = time.strftime("%H:%M:%S")
+            total_votes = sum(self._plate_votes.get(tid, {}).values())
+            print(f"[OCR] {ts} | Vehiculo #{tid} | Placa: {winner}  (lectura #{total_votes})")
 
     # ------------------------------------------------------------------
     # Callback del raton
@@ -288,20 +385,31 @@ class InteractiveSpeedTest:
                     (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (150, 150, 150), 1)
 
     def _draw_speed_labels(self, frame, tracked_vehicles):
-        """Dibuja la velocidad calculada encima de cada vehiculo."""
+        """Dibuja la velocidad calculada y la placa encima de cada vehiculo."""
         for vehicle in tracked_vehicles:
             tid    = vehicle['track_id']
             cx, cy = vehicle['centroid']
             speed  = self.speeds.get(tid)
+            plate  = self.plates.get(tid)
+
+            # Armar la etiqueta
+            label_parts = []
+            if plate:
+                label_parts.append(f"Placa: {plate}")
+            else:
+                label_parts.append("Placa: Buscando...")
 
             if speed is not None:
-                over   = speed > self.speed_limit_kmh
-                color  = (0, 0, 255) if over else (0, 220, 0)
-                label  = f"{speed:.1f} km/h {'[!]' if over else ''}"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-                cv2.rectangle(frame, (cx - 4, cy - th - 12), (cx + tw + 4, cy - 2), (0, 0, 0), -1)
-                cv2.putText(frame, label, (cx, cy - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+                label_parts.append(f"{speed:.1f} km/h")
+
+            label = " | ".join(label_parts)
+            over = speed is not None and speed > self.speed_limit_kmh
+            color = (0, 0, 255) if over else (0, 220, 0)
+            
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(frame, (cx - 4, cy - th - 12), (cx + tw + 4, cy - 2), (0, 0, 0), -1)
+            cv2.putText(frame, label, (cx, cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
     def _draw_infraction_alert(self, frame):
         """
@@ -386,14 +494,21 @@ class InteractiveSpeedTest:
 
         # Cargar YOLO
         print(f"[INFO] Cargando YOLOv8n (conf={YOLO_CONF})...")
-        self.tracker = VehicleTracker(model_path='yolov8n.pt', conf=YOLO_CONF)
+        tracker_yaml = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'custom_bytetrack.yaml'
+        )
+        self.tracker = VehicleTracker(model_path='yolov8n.pt', tracker=tracker_yaml, conf=YOLO_CONF)
         print("[OK] YOLOv8n listo.")
 
         # Cargar OCR de placas
-        # El modelo esta en src/ (donde se ejecuto el entrenamiento)
+        # Priorizar la CNN sintética (FE-Schrift), con fallback al modelo original EMNIST
         ocr_model_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn.pth'
+            os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn_synthetic.pth'
         )
+        if not os.path.exists(ocr_model_path):
+            ocr_model_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn.pth'
+            )
         self.plate_ocr = PlateOCR(model_path=ocr_model_path)
         print("[OK] PlateOCR listo.\n")
 
@@ -425,6 +540,29 @@ class InteractiveSpeedTest:
                 tracked_vehicles, annotated_frame = self.tracker.process_frame(frame)
                 self.detected_count = len(tracked_vehicles)
 
+            # Disparar OCR dinamico continuo para vehiculos en pantalla en todo momento
+            if self.plate_ocr is not None and not self.diag_mode:
+                import re
+                _plate_pattern = re.compile(r'^[A-Z]{3}-\d{4}$')
+                for vehicle in tracked_vehicles:
+                    tid = vehicle['track_id']
+                    current_plate = self.plates.get(tid, '???')
+                    # Si ya tenemos una placa valida (formato AAA-NNNN), no reintentar
+                    if _plate_pattern.match(current_plate):
+                        continue
+                    # Reintentar si no tenemos placa o si la placa es parcial/invalida
+                    if current_time - self._last_ocr_time.get(tid, 0) > 2.0:
+                        if tid not in self._ocr_running:
+                            self._ocr_running.add(tid)
+                            self._last_ocr_time[tid] = current_time
+                            frame_copy = frame.copy()
+                            t = threading.Thread(
+                                target=self._run_ocr_continuous_async,
+                                args=(tid, frame_copy, vehicle['bbox']),
+                                daemon=True,
+                            )
+                            t.start()
+
             # Calculo de velocidad y disparo de OCR
             if self.speed_calc is not None and self.click_n == 2:
                 new_speeds = self.speed_calc.update(tracked_vehicles, current_time)
@@ -433,7 +571,10 @@ class InteractiveSpeedTest:
                 for tid, spd in new_speeds.items():
                     ts = time.strftime("%H:%M:%S")
 
+                    # Determinar estado frente al límite (Infracción, Cerca del límite, Normal)
+                    diff = self.speed_limit_kmh - spd
                     if spd > self.speed_limit_kmh:
+                        status_str = f"\033[91m[INFRACCIÓN - ¡Exceso de velocidad! (+{abs(diff):.1f} km/h)]\033[0m"
                         self.alert_until = current_time + 3.0
                         self.infraction_log.append({
                             'id':    tid,
@@ -441,6 +582,12 @@ class InteractiveSpeedTest:
                             'time':  ts,
                             'plate': '...',   # Se actualiza cuando termina el OCR
                         })
+                    elif spd >= self.speed_limit_kmh - 5.0:
+                        status_str = f"\033[93m[ADVERTENCIA - Cerca del límite (-{diff:.1f} km/h)]\033[0m"
+                    else:
+                        status_str = f"\033[92m[NORMAL - Velocidad segura (-{diff:.1f} km/h)]\033[0m"
+
+                    print(f"[{ts}] Radar -> Vehículo #{tid:<2d} | Velocidad: {spd:>5.1f} km/h (Límite: {self.speed_limit_kmh:.0f} km/h) | {status_str}")
 
                     # Lanzar OCR en hilo separado si no hay uno ya corriendo para este ID
                     if self.plate_ocr is not None and tid not in self._ocr_running:

@@ -91,7 +91,9 @@ class SpeedCalculator:
                     't1': None,
                     't2': None,
                     'speed': None,
+                    'start_line': None,
                 }
+                print(f"[RADAR DEBUGINFO] 🆕 Vehículo #{track_id} detectado en zona de radar (Posición inicial {self.axis.upper()}={pos}px | Líneas L1={self.line1_pos}px, L2={self.line2_pos}px)")
 
             data = self.vehicle_data[track_id]
             data['history'].append(pos)
@@ -101,16 +103,32 @@ class SpeedCalculator:
                 data['history'].pop(0)
 
             if len(data['history']) >= 2:
-                prev_pos = data['history'][-2]
-                curr_pos = data['history'][-1]
+                # Filtrar vibración/ruido (jitter) usando un promedio móvil
+                if len(data['history']) >= 3:
+                    curr_pos = int(sum(data['history'][-3:]) / len(data['history'][-3:]))
+                    prev_pos = int(sum(data['history'][-4:-1]) / len(data['history'][-4:-1]))
+                else:
+                    prev_pos = data['history'][-2]
+                    curr_pos = data['history'][-1]
 
-                # Cruce de Linea 1
-                if data['t1'] is None and self._crossed(prev_pos, curr_pos, self.line1_pos):
-                    data['t1'] = current_time
+                # Detectar primer cruce (cualquiera de las dos líneas)
+                if data['t1'] is None:
+                    if self._is_between(prev_pos, curr_pos, self.line1_pos):
+                        data['t1'] = current_time
+                        data['start_line'] = 1
+                        print(f"[RADAR DEBUGINFO] 🚩 Vehículo #{track_id} cruzó la Línea 1 ({self.line1_pos}px) en {self.axis.upper()}={pos}px (de {prev_pos}px). Iniciando cronómetro.")
+                    elif self._is_between(prev_pos, curr_pos, self.line2_pos):
+                        data['t1'] = current_time
+                        data['start_line'] = 2
+                        print(f"[RADAR DEBUGINFO] 🚩 Vehículo #{track_id} cruzó la Línea 2 ({self.line2_pos}px) en {self.axis.upper()}={pos}px (de {prev_pos}px). Iniciando cronómetro.")
 
-                # Cruce de Linea 2 (solo si ya cruzo la linea 1)
-                if data['t1'] is not None and data['t2'] is None and self._crossed(prev_pos, curr_pos, self.line2_pos):
-                    data['t2'] = current_time
+                # Detectar segundo cruce (la línea opuesta)
+                elif data['t2'] is None:
+                    target_line = self.line2_pos if data.get('start_line') == 1 else self.line1_pos
+                    target_name = "Línea 2" if data.get('start_line') == 1 else "Línea 1"
+                    if self._is_between(prev_pos, curr_pos, target_line):
+                        data['t2'] = current_time
+                        print(f"[RADAR DEBUGINFO] 🏁 Vehículo #{track_id} cruzó la {target_name} ({target_line}px) en {self.axis.upper()}={pos}px (de {prev_pos}px). Deteniendo cronómetro.")
 
             # Calcular velocidad si se tienen ambos timestamps
             if data['t1'] is not None and data['t2'] is not None and data['speed'] is None:
@@ -133,15 +151,13 @@ class SpeedCalculator:
         self.vehicle_data.clear()
 
     # ------------------------------------------------------------------
-    # Metodo privado de cruce de linea
+    # Metodos privados de cruce de linea
     # ------------------------------------------------------------------
 
+    def _is_between(self, pos_prev: int, pos_curr: int, line: int) -> bool:
+        """Verifica si un valor (line) queda comprendido entre pos_prev y pos_curr (inclusive)."""
+        return min(pos_prev, pos_curr) <= line <= max(pos_prev, pos_curr)
+
     def _crossed(self, pos_prev: int, pos_curr: int, line: int) -> bool:
-        """
-        Verifica si el vehiculo cruzo la linea entre el frame anterior y el actual.
-        Funciona para ambos ejes (x e y) y ambas direcciones.
-        """
-        if self.direction in ('down', 'right'):
-            return pos_prev <= line < pos_curr
-        else:  # 'up' o 'left'
-            return pos_prev >= line > pos_curr
+        """Conservado por compatibilidad de firma."""
+        return self._is_between(pos_prev, pos_curr, line)

@@ -1,4 +1,5 @@
 import cv2
+import torch
 from ultralytics import YOLO
 
 
@@ -29,7 +30,8 @@ class VehicleTracker:
                           (angulo inusual, distancia, poca luz) a costa de mas falsos positivos.
             iou (float): Umbral de IoU para Non-Maximum Suppression.
         """
-        print(f"[INFO] Cargando modelo YOLO: {model_path}")
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[INFO] Cargando modelo YOLO: {model_path} en dispositivo: {self.device}")
         self.model          = YOLO(model_path)
         self.tracker_config = tracker
         self.conf           = conf
@@ -60,6 +62,7 @@ class VehicleTracker:
             conf=self.conf,
             iou=self.iou,
             verbose=False,
+            device=self.device,
         )
 
         tracked_vehicles = []
@@ -97,5 +100,5 @@ class VehicleTracker:
             int: Numero de objetos detectados.
             numpy.ndarray: Frame anotado con todas las detecciones.
         """
-        results = self.model.predict(frame, conf=self.conf, verbose=False)
+        results = self.model.predict(frame, conf=self.conf, verbose=False, device=self.device)
         return len(results[0].boxes), results[0].plot()

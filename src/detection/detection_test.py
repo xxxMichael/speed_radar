@@ -1,15 +1,20 @@
 """
 Script de prueba del sistema de deteccion de vehiculos y calculo de velocidad.
 
+Soporta dos modos de entrada:
+  - Camara en vivo (por defecto)
+  - Archivo de video (con --video <ruta>)
+
 Controles:
-    Clic x2   -> Fijar las dos lineas de medicion
-    L         -> Cambiar orientacion de lineas: VERTICAL (movimiento horizontal)
-                 / HORIZONTAL (movimiento vertical)
+    Clic x2   -> Fijar las dos lineas de medicion (zona de calibracion)
+    L         -> Cambiar orientacion de lineas: VERTICAL / HORIZONTAL
     + / -     -> Aumentar/disminuir distancia real entre lineas (metros)
     . / ,     -> Aumentar/disminuir limite de velocidad (km/h)
     D         -> Activar/desactivar modo diagnostico (muestra todos los objetos)
     R         -> Resetear lineas, velocidades y contadores
     S         -> Guardar screenshot del frame actual
+    ESPACIO   -> Pausa/continuar (solo en modo video)
+    ->        -> Avanzar 1 frame (solo en modo video, mientras esta en pausa)
     Q         -> Salir
 """
 
@@ -18,6 +23,7 @@ import time
 import threading
 import sys
 import os
+import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -41,7 +47,7 @@ SPEED_LIMIT_STEP   = 5.0        # Cuanto cambia el limite con cada pulsacion
 REAL_DISTANCE_M    = 5.0        # Distancia real inicial entre lineas (ajustable con + y -)
 REAL_DISTANCE_STEP = 0.5
 
-YOLO_CONF          = 0.30       # Umbral de confianza YOLO (subido de 0.15 para estabilizar tracking)
+YOLO_CONF          = 0.30       # Umbral de confianza YOLO
 
 WINDOW_NAME        = "Speed Radar - Deteccion (Q=salir)"
 # =============================================================================
@@ -51,26 +57,34 @@ class InteractiveSpeedTest:
     """
     Herramienta interactiva de deteccion y medicion de velocidad.
 
+    Soporta dos fuentes de video:
+      - Camara en vivo (DroidCam, webcam, etc.)
+      - Archivo de video (.mp4, .avi, etc.)
+
     Soporta lineas de medicion VERTICALES (movimiento horizontal de vehiculos)
     y HORIZONTALES (movimiento vertical de vehiculos), intercambiables con 'L'.
     El limite de velocidad y la distancia real se ajustan desde la interfaz.
+
+    Calcula velocidad por TRAYECTORIA MULTI-FRAME: mide el desplazamiento del
+    centroide del vehiculo en los ultimos N frames. Las lineas definen la zona
+    de calibracion (pixeles -> metros) y la zona de reporte.
     """
 
     # Modos de orientacion de lineas
     MODE_VERTICAL   = 'vertical'    # Lineas | |  →  miden movimiento izquierda/derecha
     MODE_HORIZONTAL = 'horizontal'  # Lineas ═ ═  →  miden movimiento arriba/abajo
 
-    def __init__(self, camera_index: int, real_distance_m: float, speed_limit_kmh: float):
+    def __init__(self, camera_index: int, real_distance_m: float,
+                 speed_limit_kmh: float, video_path: str = None):
         self.camera_index    = camera_index
         self.real_distance_m = real_distance_m
         self.speed_limit_kmh = speed_limit_kmh
+        self.video_path      = video_path  # None = camara en vivo
 
         # Orientacion de las lineas de medicion
         self.line_mode = self.MODE_VERTICAL   # Por defecto: lineas verticales
 
         # Posicion de las dos lineas (en pixeles)
-        # En modo VERTICAL  usan coordenada X (columna)
-        # En modo HORIZONTAL usan coordenada Y (fila)
         self.line1_pos = None
         self.line2_pos = None
         self.click_n   = 0
@@ -91,7 +105,14 @@ class InteractiveSpeedTest:
         self.fps_counter = 0
         self.fps_timer   = time.time()
 
+        # FPS de la fuente (se detecta al abrir)
+        self.source_fps = 30.0
+
         self.screenshot_n = 0
+
+        # --- Control de reproduccion (modo video) ---
+        self.paused     = False
+        self.frame_num  = 0
 
         # --- Infracciones ---
         self.infraction_log: list[dict] = []
@@ -279,11 +300,13 @@ class InteractiveSpeedTest:
             distance_meters=self.real_distance_m,
             direction=direction,
             axis=axis,
+            fps=self.source_fps,
         )
         self.speeds = {}
         lo = min(self.line1_pos, self.line2_pos)
         hi = max(self.line1_pos, self.line2_pos)
-        print(f"[INFO] SpeedCalculator | modo={self.line_mode} | dist={self.real_distance_m}m | L1={lo}px | L2={hi}px")
+        m_per_px = self.real_distance_m / max(1, hi - lo)
+        print(f"[INFO] SpeedCalculator (trayectoria) | modo={self.line_mode} | dist={self.real_distance_m}m | L1={lo}px | L2={hi}px | {m_per_px:.4f} m/px")
 
     def _reset_lines(self):
         """Borra las lineas, velocidades y el calculador."""
@@ -301,6 +324,17 @@ class InteractiveSpeedTest:
     def _draw_lines(self, frame):
         """Dibuja las lineas de medicion segun el modo actual."""
         h, w = frame.shape[:2]
+
+        # Dibujar zona de medicion semitransparente si ambas lineas estan fijadas
+        if self.line1_pos is not None and self.line2_pos is not None:
+            lo = min(self.line1_pos, self.line2_pos)
+            hi = max(self.line1_pos, self.line2_pos)
+            overlay = frame.copy()
+            if self.line_mode == self.MODE_VERTICAL:
+                cv2.rectangle(overlay, (lo, 0), (hi, h), (0, 180, 0), -1)
+            else:
+                cv2.rectangle(overlay, (0, lo), (w, hi), (0, 180, 0), -1)
+            cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
 
         if self.line_mode == self.MODE_VERTICAL:
             # Lineas VERTICALES (de arriba a abajo)
@@ -329,8 +363,9 @@ class InteractiveSpeedTest:
 
         # Fondo semitransparente
         panel_x = w - 310
+        panel_h = 200 if self.video_path else 175
         overlay = frame.copy()
-        cv2.rectangle(overlay, (panel_x - 6, 0), (w, 175), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (panel_x - 6, 0), (w, panel_h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
         # Colores de estado
@@ -347,6 +382,14 @@ class InteractiveSpeedTest:
 
         row = 22
         step = 22
+
+        # Fuente de video
+        if self.video_path:
+            src_label = f"Video: {os.path.basename(self.video_path)}"
+            pause_label = " [PAUSA]" if self.paused else ""
+            cv2.putText(frame, f"{src_label}{pause_label}",
+                        (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
+            row += step
 
         cv2.putText(frame, click_states[self.click_n],
                     (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ready_color, 1)
@@ -381,8 +424,18 @@ class InteractiveSpeedTest:
                     (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.50, diag_color, 1)
         row += step
 
-        cv2.putText(frame, "[R] Reset   [S] Screenshot   [Q] Salir",
-                    (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (150, 150, 150), 1)
+        controls = "[R] Reset   [S] Screenshot   [Q] Salir"
+        if self.video_path:
+            controls = "[SPC] Pausa  " + controls
+        cv2.putText(frame, controls,
+                    (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+
+        # Alerta visual si falta configurar las lineas de calibracion
+        if self.click_n < 2:
+            warn_msg = "AVISO: Haga 2 clics en la pantalla para fijar las lineas de calibracion"
+            cv2.rectangle(frame, (10, h - 35), (w - 10, h - 10), (0, 0, 0), -1)
+            cv2.putText(frame, warn_msg, (20, h - 17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 140, 255), 1)
 
     def _draw_speed_labels(self, frame, tracked_vehicles):
         """Dibuja la velocidad calculada y la placa encima de cada vehiculo."""
@@ -391,6 +444,10 @@ class InteractiveSpeedTest:
             cx, cy = vehicle['centroid']
             speed  = self.speeds.get(tid)
             plate  = self.plates.get(tid)
+
+            # Usar la velocidad en tiempo real de la trayectoria si aun no esta reportada
+            if speed is None and self.speed_calc is not None:
+                speed = self.speed_calc.get_speed(tid)
 
             # Armar la etiqueta
             label_parts = []
@@ -457,6 +514,47 @@ class InteractiveSpeedTest:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 60, 255), 1)
 
     # ------------------------------------------------------------------
+    # Abrir fuente de video
+    # ------------------------------------------------------------------
+
+    def _open_source(self):
+        """
+        Abre la fuente de video (camara o archivo) y retorna el VideoCapture.
+
+        Returns:
+            tuple: (cap, fw, fh, fps) o None si fallo.
+        """
+        if self.video_path:
+            # --- Modo archivo de video ---
+            if not os.path.exists(self.video_path):
+                print(f"[ERROR] Archivo de video no encontrado: {self.video_path}")
+                return None
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                print(f"[ERROR] No se pudo abrir el video: {self.video_path}")
+                return None
+            fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            print(f"[INFO] Video abierto: {self.video_path}")
+            print(f"[INFO] Resolucion: {fw}x{fh} | FPS: {fps:.1f} | Frames: {total}")
+        else:
+            # --- Modo camara en vivo ---
+            cap = cv2.VideoCapture(self.camera_index, CAMERA_BACKEND)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                print(f"[ERROR] No se pudo abrir la camara {self.camera_index}.")
+                return None
+            fw  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fh  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            print(f"[INFO] Camara abierta: {fw}x{fh}")
+
+        self.source_fps = fps
+        return cap, fw, fh, fps
+
+    # ------------------------------------------------------------------
     # Bucle principal
     # ------------------------------------------------------------------
 
@@ -464,33 +562,52 @@ class InteractiveSpeedTest:
         print("\n" + "=" * 65)
         print("  SPEED RADAR - TEST INTERACTIVO")
         print("=" * 65)
-        print(f"  Camara         : indice {self.camera_index}")
+
+        if self.video_path:
+            print(f"  Fuente         : VIDEO -> {self.video_path}")
+        else:
+            print(f"  Fuente         : CAMARA indice {self.camera_index}")
+
         print(f"  Limite inicial : {self.speed_limit_kmh} km/h  (ajustar con , / .)")
         print(f"  Distancia init : {self.real_distance_m} m   (ajustar con - / +)")
         print(f"  YOLO conf      : {YOLO_CONF}")
+        print(f"  Algoritmo vel. : Trayectoria multi-frame")
         print("-" * 65)
         print("  CONTROLES:")
-        print("    Clic x2  -> Fijar lineas de medicion")
+        print("    Clic x2  -> Fijar lineas de medicion (zona de calibracion)")
         print("    L        -> Cambiar orientacion lineas (VERTICAL / HORIZONTAL)")
         print("    + / -    -> Distancia real entre lineas")
         print("    . / ,    -> Limite de velocidad")
         print("    D        -> Modo diagnostico (ver todos los objetos)")
         print("    R        -> Resetear")
         print("    S        -> Screenshot")
+        if self.video_path:
+            print("    ESPACIO  -> Pausa/continuar")
+            print("    ->       -> Avanzar 1 frame (en pausa)")
         print("    Q        -> Salir")
-        print("=" * 65 + "\n")
+        print("=" * 65)
+        print("\n[IMPORTANTE] Para calcular y ver las velocidades en consola y video:")
+        print("  1. Haga DOS CLICS en la ventana del video para fijar las lineas L1 y L2.")
+        print("  2. Asegurese de que la orientacion (Vertical/Horizontal) con tecla 'L' coincida con la trayectoria.")
+        print("  3. Ajuste la distancia de separacion real en metros con las teclas '+' y '-'.\n")
 
-        # Abrir camara
-        cap = cv2.VideoCapture(self.camera_index, CAMERA_BACKEND)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            print(f"[ERROR] No se pudo abrir la camara {self.camera_index}.")
+        # Abrir fuente
+        result = self._open_source()
+        if result is None:
             return
+        cap, fw, fh, fps = result
 
-        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[INFO] Camara abierta: {fw}x{fh}")
+        # Configurar lineas de calibracion por defecto si no se han establecido
+        if self.line1_pos is None and self.line2_pos is None:
+            if self.line_mode == self.MODE_VERTICAL:
+                self.line1_pos = int(fw * 0.20)
+                self.line2_pos = int(fw * 0.80)
+            else:
+                self.line1_pos = int(fh * 0.20)
+                self.line2_pos = int(fh * 0.80)
+            self.click_n = 2
+            self._init_speed_calculator()
+            print(f"[INFO] Lineas de calibracion por defecto activadas: L1={self.line1_pos}px, L2={self.line2_pos}px. SpeedCalculator activo.")
 
         # Cargar YOLO
         print(f"[INFO] Cargando YOLOv8n (conf={YOLO_CONF})...")
@@ -516,21 +633,64 @@ class InteractiveSpeedTest:
         cv2.resizeWindow(WINDOW_NAME, min(fw, 1280), min(fh, 720))
         cv2.setMouseCallback(WINDOW_NAME, self._mouse_callback)
 
+        # Delay entre frames para sincronizar con FPS del video
+        frame_delay_ms = int(1000 / fps) if self.video_path else 1
+
         while True:
+            # --- Control de pausa (solo modo video) ---
+            if self.paused and self.video_path:
+                key = cv2.waitKey(50) & 0xFF
+                if key == ord(' '):  # Espacio: continuar
+                    self.paused = False
+                    print("[INFO] Reproduccion reanudada.")
+                elif key == 83 or key == ord('n'):  # Flecha derecha o N: avanzar 1 frame
+                    pass  # Dejar que el frame se lea abajo
+                elif key == ord('q') or key == 27:
+                    break
+                elif key == ord('r'):
+                    self._reset_lines()
+                    continue
+                elif key == ord('s'):
+                    fname = f"screenshot_{self.screenshot_n:03d}.jpg"
+                    cv2.imwrite(fname, self._last_frame if hasattr(self, '_last_frame') else frame)
+                    print(f"[INFO] Screenshot guardado: {fname}")
+                    self.screenshot_n += 1
+                    continue
+                else:
+                    continue  # Queda en pausa sin leer frame
+
             ret, frame = cap.read()
             if not ret or frame is None:
-                time.sleep(0.05)
-                continue
+                if self.video_path:
+                    # Loop: reiniciar desde el inicio
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self.frame_num = 0
+                    # Resetear tracker y velocidades para el nuevo loop
+                    if self.speed_calc:
+                        self.speed_calc.reset()
+                    self.speeds = {}
+                    print("[INFO] Video reiniciado (loop).")
+                    continue
+                else:
+                    time.sleep(0.05)
+                    continue
 
-            current_time = time.time()
+            self.frame_num += 1
 
-            # Calcular FPS
+            # Timestamp: usar frame_num / fps para video, time.time() para camara
+            if self.video_path:
+                current_time = self.frame_num / self.source_fps
+            else:
+                current_time = time.time()
+
+            # Calcular FPS de procesamiento
+            wall_time = time.time()
             self.fps_counter += 1
-            elapsed = current_time - self.fps_timer
+            elapsed = wall_time - self.fps_timer
             if elapsed >= 1.0:
                 self.fps_display = self.fps_counter / elapsed
                 self.fps_counter = 0
-                self.fps_timer   = current_time
+                self.fps_timer   = wall_time
 
             # Deteccion
             if self.diag_mode:
@@ -551,10 +711,10 @@ class InteractiveSpeedTest:
                     if _plate_pattern.match(current_plate):
                         continue
                     # Reintentar si no tenemos placa o si la placa es parcial/invalida
-                    if current_time - self._last_ocr_time.get(tid, 0) > 2.0:
+                    if time.time() - self._last_ocr_time.get(tid, 0) > 2.0:
                         if tid not in self._ocr_running:
                             self._ocr_running.add(tid)
-                            self._last_ocr_time[tid] = current_time
+                            self._last_ocr_time[tid] = time.time()
                             frame_copy = frame.copy()
                             t = threading.Thread(
                                 target=self._run_ocr_continuous_async,
@@ -563,7 +723,7 @@ class InteractiveSpeedTest:
                             )
                             t.start()
 
-            # Calculo de velocidad y disparo de OCR
+            # Calculo de velocidad por trayectoria y disparo de OCR
             if self.speed_calc is not None and self.click_n == 2:
                 new_speeds = self.speed_calc.update(tracked_vehicles, current_time)
                 self.speeds.update(new_speeds)
@@ -575,7 +735,7 @@ class InteractiveSpeedTest:
                     diff = self.speed_limit_kmh - spd
                     if spd > self.speed_limit_kmh:
                         status_str = f"\033[91m[INFRACCIÓN - ¡Exceso de velocidad! (+{abs(diff):.1f} km/h)]\033[0m"
-                        self.alert_until = current_time + 3.0
+                        self.alert_until = time.time() + 3.0
                         self.infraction_log.append({
                             'id':    tid,
                             'speed': spd,
@@ -605,6 +765,9 @@ class InteractiveSpeedTest:
                             )
                             t.start()
 
+            # Guardar ultimo frame para screenshots en pausa
+            self._last_frame = annotated_frame
+
             # Dibujar
             self._draw_lines(annotated_frame)
             self._draw_speed_labels(annotated_frame, tracked_vehicles)
@@ -615,10 +778,14 @@ class InteractiveSpeedTest:
             cv2.imshow(WINDOW_NAME, annotated_frame)
 
             # --- Teclado ---
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(frame_delay_ms) & 0xFF
 
             if key == ord('q') or key == 27:       # Q o Esc
                 break
+
+            elif key == ord(' ') and self.video_path:  # Espacio: pausa
+                self.paused = True
+                print("[INFO] Reproduccion en pausa. [ESPACIO]=continuar, [->]=avanzar frame")
 
             elif key == ord('l'):                   # L: cambiar orientacion de lineas
                 if self.line_mode == self.MODE_VERTICAL:
@@ -666,10 +833,33 @@ class InteractiveSpeedTest:
         print("\n[INFO] Test finalizado.")
 
 
+def parse_args():
+    """Parsea argumentos de linea de comandos."""
+    parser = argparse.ArgumentParser(
+        description="Speed Radar - Test Interactivo de Deteccion de Velocidad"
+    )
+    parser.add_argument(
+        '--video', '-v',
+        type=str,
+        default=None,
+        help='Ruta a un archivo de video (.mp4, .avi). Si no se especifica, usa la camara en vivo.'
+    )
+    parser.add_argument(
+        '--camera', '-c',
+        type=int,
+        default=CAMERA_INDEX,
+        help=f'Indice de la camara (default: {CAMERA_INDEX}). Ignorado si se usa --video.'
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
     test = InteractiveSpeedTest(
-        camera_index=CAMERA_INDEX,
+        camera_index=args.camera,
         real_distance_m=REAL_DISTANCE_M,
         speed_limit_kmh=SPEED_LIMIT_KMH,
+        video_path=args.video,
     )
     test.run()

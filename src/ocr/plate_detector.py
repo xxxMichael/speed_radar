@@ -16,6 +16,7 @@ import os
 import cv2
 import numpy as np
 import threading
+import torch
 
 try:
     from ultralytics import YOLO
@@ -55,6 +56,7 @@ class PlateDetector:
                             Valores altos son mas estrictos.
         """
         self.conf_threshold = conf_threshold
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = None
         self._loaded = False
         self._is_base_model = False  # True cuando se usa yolov8n.pt en lugar del modelo fine-tuned
@@ -151,7 +153,7 @@ class PlateDetector:
         try:
             self.model = YOLO(path)
             self._loaded = True
-            print(f"[PlateDetector] Modelo cargado: {os.path.basename(path)}")
+            print(f"[PlateDetector] Modelo cargado: {os.path.basename(path)} en dispositivo: {self.device}")
 
             # Verificar si el modelo tiene clases de deteccion de placas
             # Si solo tiene clases COCO (80) sin 'license_plate', es el modelo base
@@ -219,7 +221,8 @@ class PlateDetector:
                     vehicle_crop,
                     conf=self.conf_threshold,
                     verbose=False,
-                    imgsz=640    # Resolucion estandar para detectar objetos pequenos/lejanos
+                    imgsz=640,    # Resolucion estandar para detectar objetos pequenos/lejanos
+                    device=self.device
                 )
 
             if not results or results[0].boxes is None:

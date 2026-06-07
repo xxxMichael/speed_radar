@@ -129,6 +129,10 @@ class InteractiveSpeedTest:
         # Ultimo tiempo de escaneo por vehiculo (para reintentos dinamicos)
         self._last_ocr_time: dict[int, float] = {}
 
+        # Snapshots para procesar el mejor frame en salida
+        self._best_vehicle_snapshots: dict[int, dict] = {} # {track_id: {'area': float, 'frame': np.ndarray, 'bbox': list}}
+        self._infractions_to_process: set[int] = set()       # {track_id, ...}
+
         # --- Sistema Difuso de Multas ---
         self.fine_system = FineSystem()
 
@@ -171,16 +175,23 @@ class InteractiveSpeedTest:
             
             print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Multa Difusa: ${fine_amount:.2f} USD")
             
-            # Recortar la imagen del vehículo para enviarla como evidencia
+            # Recortar la imagen del vehículo con un margen amplio para mostrar la carretera y el entorno
             try:
                 h, w = frame_copy.shape[:2]
                 x1, y1, x2, y2 = bbox
-                # Asegurar límites dentro del frame
-                x1, y1 = max(0, int(x1)), max(0, int(y1))
-                x2, y2 = min(w, int(x2)), min(h, int(y2))
+                bw = x2 - x1
+                bh = y2 - y1
+                # Agregar margen de contexto (ej. 35% del tamaño del bbox, mínimo 100px de ancho y 80px de alto)
+                pad_w = int(max(100, bw * 0.35))
+                pad_h = int(max(80, bh * 0.35))
                 
-                if x2 > x1 and y2 > y1:
-                    vehicle_crop = frame_copy[y1:y2, x1:x2]
+                cx1 = max(0, int(x1 - pad_w))
+                cy1 = max(0, int(y1 - pad_h))
+                cx2 = min(w, int(x2 + pad_w))
+                cy2 = min(h, int(y2 + pad_h))
+                
+                if cx2 > cx1 and cy2 > cy1:
+                    vehicle_crop = frame_copy[cy1:cy2, cx1:cx2]
                 else:
                     vehicle_crop = None
             except Exception as e:
@@ -316,6 +327,54 @@ class InteractiveSpeedTest:
         self.speed_calc = None
         self.speeds     = {}
         print("[INFO] Lineas y velocidades reseteadas.")
+
+    def _process_key(self, key, frame_to_save=None) -> bool:
+        """Procesa las teclas de control. Retorna True si se debe salir."""
+        if key == ord('q') or key == 27:       # Q o Esc
+            return True
+
+        elif key == ord('l'):                   # L: cambiar orientacion de lineas
+            if self.line_mode == self.MODE_VERTICAL:
+                self.line_mode = self.MODE_HORIZONTAL
+            else:
+                self.line_mode = self.MODE_VERTICAL
+            print(f"[INFO] Orientacion de lineas: {self.line_mode.upper()}")
+            self._reset_lines()
+
+        elif key == ord('d'):                   # D: diagnostico
+            self.diag_mode = not self.diag_mode
+            print(f"[INFO] Diagnostico: {'ON' if self.diag_mode else 'OFF'}")
+
+        elif key == ord('r'):                   # R: resetear
+            self._reset_lines()
+
+        elif key == ord('+') or key == ord('='):    # +: mas distancia
+            self.real_distance_m = round(self.real_distance_m + REAL_DISTANCE_STEP, 1)
+            print(f"[INFO] Distancia real: {self.real_distance_m} m")
+            if self.click_n == 2:
+                self._init_speed_calculator()
+
+        elif key == ord('-'):                   # -: menos distancia
+            self.real_distance_m = max(0.5, round(self.real_distance_m - REAL_DISTANCE_STEP, 1))
+            print(f"[INFO] Distancia real: {self.real_distance_m} m")
+            if self.click_n == 2:
+                self._init_speed_calculator()
+
+        elif key == ord('.'):                   # .: mas limite de velocidad
+            self.speed_limit_kmh = round(self.speed_limit_kmh + SPEED_LIMIT_STEP, 0)
+            print(f"[INFO] Limite de velocidad: {self.speed_limit_kmh:.0f} km/h")
+
+        elif key == ord(','):                   # ,: menos limite de velocidad
+            self.speed_limit_kmh = max(5.0, round(self.speed_limit_kmh - SPEED_LIMIT_STEP, 0))
+            print(f"[INFO] Limite de velocidad: {self.speed_limit_kmh:.0f} km/h")
+
+        elif key == ord('s') and frame_to_save is not None:                   # S: screenshot
+            fname = f"screenshot_{self.screenshot_n:03d}.jpg"
+            cv2.imwrite(fname, frame_to_save)
+            print(f"[INFO] Screenshot guardado: {fname}")
+            self.screenshot_n += 1
+
+        return False
 
     # ------------------------------------------------------------------
     # Renderizado del HUD
@@ -453,8 +512,8 @@ class InteractiveSpeedTest:
             label_parts = []
             if plate:
                 label_parts.append(f"Placa: {plate}")
-            else:
-                label_parts.append("Placa: Buscando...")
+            elif tid in self._ocr_running:
+                label_parts.append("Placa: Escaneando...")
 
             if speed is not None:
                 label_parts.append(f"{speed:.1f} km/h")
@@ -636,197 +695,210 @@ class InteractiveSpeedTest:
         # Delay entre frames para sincronizar con FPS del video
         frame_delay_ms = int(1000 / fps) if self.video_path else 1
 
-        while True:
-            # --- Control de pausa (solo modo video) ---
-            if self.paused and self.video_path:
-                key = cv2.waitKey(50) & 0xFF
-                if key == ord(' '):  # Espacio: continuar
-                    self.paused = False
-                    print("[INFO] Reproduccion reanudada.")
-                elif key == 83 or key == ord('n'):  # Flecha derecha o N: avanzar 1 frame
-                    pass  # Dejar que el frame se lea abajo
-                elif key == ord('q') or key == 27:
-                    break
-                elif key == ord('r'):
-                    self._reset_lines()
-                    continue
-                elif key == ord('s'):
-                    fname = f"screenshot_{self.screenshot_n:03d}.jpg"
-                    cv2.imwrite(fname, self._last_frame if hasattr(self, '_last_frame') else frame)
-                    print(f"[INFO] Screenshot guardado: {fname}")
-                    self.screenshot_n += 1
-                    continue
-                else:
-                    continue  # Queda en pausa sin leer frame
+        # Inicializar variables para el bucle de pausa y refresco interactivo
+        self._last_raw_frame = None
+        self._last_annotated_frame = None
+        self._last_tracked_vehicles = []
+        self._step_one_frame = False
 
-            ret, frame = cap.read()
-            if not ret or frame is None:
+        while True:
+            # --- Decidir si leer un nuevo frame ---
+            read_new_frame = not self.paused or self._step_one_frame
+            self._step_one_frame = False
+
+            if read_new_frame:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    if self.video_path:
+                        # Loop: reiniciar desde el inicio
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        self.frame_num = 0
+                        # Resetear tracker y velocidades para el nuevo loop
+                        if self.speed_calc:
+                            self.speed_calc.reset()
+                        self.speeds = {}
+                        print("[INFO] Video reiniciado (loop).")
+                        continue
+                    else:
+                        time.sleep(0.05)
+                        continue
+
+                self.frame_num += 1
+                self._last_raw_frame = frame.copy()
+
+                # Timestamp: usar frame_num / fps para video, time.time() para camara
                 if self.video_path:
-                    # Loop: reiniciar desde el inicio
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    self.frame_num = 0
-                    # Resetear tracker y velocidades para el nuevo loop
-                    if self.speed_calc:
-                        self.speed_calc.reset()
-                    self.speeds = {}
-                    print("[INFO] Video reiniciado (loop).")
-                    continue
+                    current_time = self.frame_num / self.source_fps
+                else:
+                    current_time = time.time()
+
+                # Calcular FPS de procesamiento
+                wall_time = time.time()
+                self.fps_counter += 1
+                elapsed = wall_time - self.fps_timer
+                if elapsed >= 1.0:
+                    self.fps_display = self.fps_counter / elapsed
+                    self.fps_counter = 0
+                    self.fps_timer   = wall_time
+
+                # Deteccion
+                if self.diag_mode:
+                    self.detected_count, annotated_frame = self.tracker.detect_all(frame)
+                    tracked_vehicles = []
+                else:
+                    tracked_vehicles, annotated_frame = self.tracker.process_frame(frame)
+                    self.detected_count = len(tracked_vehicles)
+
+                self._last_annotated_frame = annotated_frame.copy()
+                self._last_tracked_vehicles = tracked_vehicles
+
+                # Actualizar el snapshot con la mayor area (vehiculo mas cercano/grande) para OCR,
+                # ignorando aquellos frames donde el vehiculo toque los bordes del frame para evitar que la placa salga cortada.
+                h_f, w_f = frame.shape[:2]
+                for vehicle in tracked_vehicles:
+                    tid = vehicle['track_id']
+                    x1, y1, x2, y2 = vehicle['bbox']
+                    area = (x2 - x1) * (y2 - y1)
+                    
+                    # Determinar si el vehiculo toca los bordes de la pantalla (con margen de 6px)
+                    touches_border = (x1 <= 6) or (y1 <= 6) or (x2 >= w_f - 6) or (y2 >= h_f - 6)
+                    
+                    self._best_vehicle_snapshots.setdefault(tid, {})
+                    # Siempre registrar el ultimo frame disponible como fallback absoluto
+                    self._best_vehicle_snapshots[tid]['fallback'] = {
+                        'frame': frame.copy(),
+                        'bbox': vehicle['bbox']
+                    }
+                    
+                    # Si no toca los bordes, guardar el frame con el area maxima
+                    if not touches_border:
+                        if 'area' not in self._best_vehicle_snapshots[tid] or area > self._best_vehicle_snapshots[tid]['area']:
+                            self._best_vehicle_snapshots[tid]['area'] = area
+                            self._best_vehicle_snapshots[tid]['frame'] = frame.copy()
+                            self._best_vehicle_snapshots[tid]['bbox'] = vehicle['bbox']
+
+                # Calculo de velocidad por trayectoria y disparo de OCR en infracciones al salir
+                if self.speed_calc is not None and self.click_n == 2:
+                    new_speeds = self.speed_calc.update(tracked_vehicles, current_time)
+                    self.speeds.update(new_speeds)
+
+                    for tid, spd in new_speeds.items():
+                        ts = time.strftime("%H:%M:%S")
+
+                        # Determinar estado frente al límite (Infracción, Cerca del límite, Normal)
+                        diff = self.speed_limit_kmh - spd
+                        if spd > self.speed_limit_kmh:
+                            status_str = f"\033[91m[INFRACCIÓN - ¡Exceso de velocidad! (+{abs(diff):.1f} km/h)]\033[0m"
+                            self.alert_until = time.time() + 3.0
+                            self.infraction_log.append({
+                                'id':    tid,
+                                'speed': spd,
+                                'time':  ts,
+                                'plate': '...',   # Se actualiza cuando el vehiculo sale y termina el OCR
+                            })
+                            # Marcar para procesar OCR diferido cuando salga del frame
+                            self._infractions_to_process.add(tid)
+
+                        elif spd >= self.speed_limit_kmh - 5.0:
+                            status_str = f"\033[93m[ADVERTENCIA - Cerca del límite (-{diff:.1f} km/h)]\033[0m"
+                        else:
+                            status_str = f"\033[92m[NORMAL - Velocidad segura (-{diff:.1f} km/h)]\033[0m"
+
+                        print(f"[{ts}] Radar -> Vehículo #{tid:<2d} | Velocidad: {spd:>5.1f} km/h (Límite: {self.speed_limit_kmh:.0f} km/h) | {status_str}")
+
+                # Procesar OCR diferido de vehiculos infractores que acaban de salir de la pantalla
+                current_ids = {v['track_id'] for v in tracked_vehicles}
+                for tid in list(self._infractions_to_process):
+                    if tid not in current_ids:
+                        self._infractions_to_process.remove(tid)
+                        snap = self._best_vehicle_snapshots.get(tid)
+                        if snap is not None:
+                            best_frame = snap.get('frame')
+                            best_bbox = snap.get('bbox')
+                            
+                            # Fallback al ultimo frame registrado si no hubo ningun cuadro completamente dentro de los bordes
+                            if best_frame is None and 'fallback' in snap:
+                                best_frame = snap['fallback']['frame']
+                                best_bbox = snap['fallback']['bbox']
+
+                            if best_frame is not None and self.plate_ocr is not None and tid not in self._ocr_running:
+                                self._ocr_running.add(tid)
+                                # Buscar velocidad registrada
+                                inf_data = next((inf for inf in self.infraction_log if inf['id'] == tid), None)
+                                spd_val = inf_data['speed'] if inf_data else self.speeds.get(tid, 0.0)
+                                t = threading.Thread(
+                                    target=self._run_ocr_async,
+                                    args=(tid, best_frame, best_bbox, spd_val),
+                                    daemon=True,
+                                )
+                                t.start()
+                        self._best_vehicle_snapshots.pop(tid, None)
+
+                # Limpiar snapshots de vehiculos normales que salieron (no cometieron infraccion)
+                for tid in list(self._best_vehicle_snapshots.keys()):
+                    if tid not in current_ids and tid not in self._infractions_to_process:
+                        self._best_vehicle_snapshots.pop(tid, None)
+            else:
+                # Si esta pausado, usar el ultimo frame e info guardados
+                if self._last_raw_frame is not None:
+                    frame = self._last_raw_frame.copy()
+                    annotated_frame = self._last_annotated_frame.copy()
+                    tracked_vehicles = self._last_tracked_vehicles
                 else:
                     time.sleep(0.05)
                     continue
 
-            self.frame_num += 1
-
-            # Timestamp: usar frame_num / fps para video, time.time() para camara
-            if self.video_path:
-                current_time = self.frame_num / self.source_fps
-            else:
-                current_time = time.time()
-
-            # Calcular FPS de procesamiento
-            wall_time = time.time()
-            self.fps_counter += 1
-            elapsed = wall_time - self.fps_timer
-            if elapsed >= 1.0:
-                self.fps_display = self.fps_counter / elapsed
-                self.fps_counter = 0
-                self.fps_timer   = wall_time
-
-            # Deteccion
-            if self.diag_mode:
-                self.detected_count, annotated_frame = self.tracker.detect_all(frame)
-                tracked_vehicles = []
-            else:
-                tracked_vehicles, annotated_frame = self.tracker.process_frame(frame)
-                self.detected_count = len(tracked_vehicles)
-
-            # Disparar OCR dinamico continuo para vehiculos en pantalla en todo momento
-            if self.plate_ocr is not None and not self.diag_mode:
-                import re
-                _plate_pattern = re.compile(r'^[A-Z]{3}-\d{4}$')
-                for vehicle in tracked_vehicles:
-                    tid = vehicle['track_id']
-                    current_plate = self.plates.get(tid, '???')
-                    # Si ya tenemos una placa valida (formato AAA-NNNN), no reintentar
-                    if _plate_pattern.match(current_plate):
-                        continue
-                    # Reintentar si no tenemos placa o si la placa es parcial/invalida
-                    if time.time() - self._last_ocr_time.get(tid, 0) > 2.0:
-                        if tid not in self._ocr_running:
-                            self._ocr_running.add(tid)
-                            self._last_ocr_time[tid] = time.time()
-                            frame_copy = frame.copy()
-                            t = threading.Thread(
-                                target=self._run_ocr_continuous_async,
-                                args=(tid, frame_copy, vehicle['bbox']),
-                                daemon=True,
-                            )
-                            t.start()
-
-            # Calculo de velocidad por trayectoria y disparo de OCR
-            if self.speed_calc is not None and self.click_n == 2:
-                new_speeds = self.speed_calc.update(tracked_vehicles, current_time)
-                self.speeds.update(new_speeds)
-
-                for tid, spd in new_speeds.items():
-                    ts = time.strftime("%H:%M:%S")
-
-                    # Determinar estado frente al límite (Infracción, Cerca del límite, Normal)
-                    diff = self.speed_limit_kmh - spd
-                    if spd > self.speed_limit_kmh:
-                        status_str = f"\033[91m[INFRACCIÓN - ¡Exceso de velocidad! (+{abs(diff):.1f} km/h)]\033[0m"
-                        self.alert_until = time.time() + 3.0
-                        self.infraction_log.append({
-                            'id':    tid,
-                            'speed': spd,
-                            'time':  ts,
-                            'plate': '...',   # Se actualiza cuando termina el OCR
-                        })
-                    elif spd >= self.speed_limit_kmh - 5.0:
-                        status_str = f"\033[93m[ADVERTENCIA - Cerca del límite (-{diff:.1f} km/h)]\033[0m"
-                    else:
-                        status_str = f"\033[92m[NORMAL - Velocidad segura (-{diff:.1f} km/h)]\033[0m"
-
-                    print(f"[{ts}] Radar -> Vehículo #{tid:<2d} | Velocidad: {spd:>5.1f} km/h (Límite: {self.speed_limit_kmh:.0f} km/h) | {status_str}")
-
-                    # Lanzar OCR en hilo separado si no hay uno ya corriendo para este ID
-                    if self.plate_ocr is not None and tid not in self._ocr_running:
-                        # Buscar el bbox del vehiculo en la lista actual
-                        vehicle_data = next(
-                            (v for v in tracked_vehicles if v['track_id'] == tid), None
-                        )
-                        if vehicle_data is not None:
-                            self._ocr_running.add(tid)
-                            frame_copy = frame.copy()
-                            t = threading.Thread(
-                                target=self._run_ocr_async,
-                                args=(tid, frame_copy, vehicle_data['bbox'], spd),
-                                daemon=True,
-                            )
-                            t.start()
-
             # Guardar ultimo frame para screenshots en pausa
             self._last_frame = annotated_frame
 
-            # Dibujar
-            self._draw_lines(annotated_frame)
-            self._draw_speed_labels(annotated_frame, tracked_vehicles)
-            self._draw_hud(annotated_frame)
-            self._draw_infraction_alert(annotated_frame)   # Borde rojo parpadeante
-            self._draw_infraction_log(annotated_frame)     # Historial de infracciones
+            # Dibujar sobre una copia del frame anotado para evitar acumular dibujos
+            display_frame = annotated_frame.copy()
+            self._draw_lines(display_frame)
+            self._draw_speed_labels(display_frame, tracked_vehicles)
+            self._draw_hud(display_frame)
+            self._draw_infraction_alert(display_frame)   # Borde rojo parpadeante
+            self._draw_infraction_log(display_frame)     # Historial de infracciones
 
-            cv2.imshow(WINDOW_NAME, annotated_frame)
+            cv2.imshow(WINDOW_NAME, display_frame)
 
             # --- Teclado ---
-            key = cv2.waitKey(frame_delay_ms) & 0xFF
+            delay = 50 if self.paused else frame_delay_ms
+            key = cv2.waitKey(delay) & 0xFF
 
-            if key == ord('q') or key == 27:       # Q o Esc
-                break
-
-            elif key == ord(' ') and self.video_path:  # Espacio: pausa
-                self.paused = True
-                print("[INFO] Reproduccion en pausa. [ESPACIO]=continuar, [->]=avanzar frame")
-
-            elif key == ord('l'):                   # L: cambiar orientacion de lineas
-                if self.line_mode == self.MODE_VERTICAL:
-                    self.line_mode = self.MODE_HORIZONTAL
+            if key != 255:  # Si se presiono una tecla
+                if key == ord(' ') and self.video_path:  # Espacio: pausa/reanudar
+                    self.paused = not self.paused
+                    state_str = "pausa" if self.paused else "reproduccion"
+                    print(f"[INFO] Estado: {state_str.upper()}.")
+                elif key == 83 or key == ord('n'):  # Flecha derecha o N: avanzar 1 frame
+                    if self.paused:
+                        self._step_one_frame = True
+                        print("[INFO] Avanzando 1 frame.")
                 else:
-                    self.line_mode = self.MODE_VERTICAL
-                print(f"[INFO] Orientacion de lineas: {self.line_mode.upper()}")
-                self._reset_lines()
+                    should_quit = self._process_key(key, display_frame)
+                    if should_quit:
+                        break
 
-            elif key == ord('d'):                   # D: diagnostico
-                self.diag_mode = not self.diag_mode
-                print(f"[INFO] Diagnostico: {'ON' if self.diag_mode else 'OFF'}")
+        # Al salir (Q o fin de video), procesar cualquier infraccion pendiente de forma sincrona para asegurar el envio
+        if self._infractions_to_process:
+            print(f"\n[INFO] Procesando {len(self._infractions_to_process)} infracciones pendientes antes de salir...")
+            for tid in list(self._infractions_to_process):
+                snap = self._best_vehicle_snapshots.get(tid)
+                if snap is not None and self.plate_ocr is not None:
+                    best_frame = snap.get('frame')
+                    best_bbox = snap.get('bbox')
+                    
+                    if best_frame is None and 'fallback' in snap:
+                        best_frame = snap['fallback']['frame']
+                        best_bbox = snap['fallback']['bbox']
 
-            elif key == ord('r'):                   # R: resetear
-                self._reset_lines()
-
-            elif key == ord('+') or key == ord('='):    # +: mas distancia
-                self.real_distance_m = round(self.real_distance_m + REAL_DISTANCE_STEP, 1)
-                print(f"[INFO] Distancia real: {self.real_distance_m} m")
-                if self.click_n == 2:
-                    self._init_speed_calculator()
-
-            elif key == ord('-'):                   # -: menos distancia
-                self.real_distance_m = max(0.5, round(self.real_distance_m - REAL_DISTANCE_STEP, 1))
-                print(f"[INFO] Distancia real: {self.real_distance_m} m")
-                if self.click_n == 2:
-                    self._init_speed_calculator()
-
-            elif key == ord('.'):                   # .: mas limite de velocidad
-                self.speed_limit_kmh = round(self.speed_limit_kmh + SPEED_LIMIT_STEP, 0)
-                print(f"[INFO] Limite de velocidad: {self.speed_limit_kmh:.0f} km/h")
-
-            elif key == ord(','):                   # ,: menos limite de velocidad
-                self.speed_limit_kmh = max(5.0, round(self.speed_limit_kmh - SPEED_LIMIT_STEP, 0))
-                print(f"[INFO] Limite de velocidad: {self.speed_limit_kmh:.0f} km/h")
-
-            elif key == ord('s'):                   # S: screenshot
-                fname = f"screenshot_{self.screenshot_n:03d}.jpg"
-                cv2.imwrite(fname, annotated_frame)
-                print(f"[INFO] Screenshot guardado: {fname}")
-                self.screenshot_n += 1
+                    if best_frame is not None:
+                        inf_data = next((inf for inf in self.infraction_log if inf['id'] == tid), None)
+                        spd_val = inf_data['speed'] if inf_data else self.speeds.get(tid, 0.0)
+                        try:
+                            self._run_ocr_async(tid, best_frame, best_bbox, spd_val)
+                        except Exception as e:
+                            print(f"[ERROR] No se pudo procesar la infraccion de salida para vehiculo #{tid}: {e}")
 
         cap.release()
         cv2.destroyAllWindows()

@@ -113,8 +113,7 @@ def generate_base_char(ch: str, font_path: str, size: int) -> np.ndarray:
 
 
 def apply_augmentations(img: np.ndarray) -> np.ndarray:
-    """Applies random rotations, shifts, blurs, stroke modifications, and noise."""
-    # Convert to PIL Image for easy rotation and affine transforms
+    """Applies random rotations, shifts, blurs, stroke modifications, noise, cuts, spots, and tampering."""
     pil_img = Image.fromarray(img)
     w, h = pil_img.size
     
@@ -125,7 +124,6 @@ def apply_augmentations(img: np.ndarray) -> np.ndarray:
     # 2. Random Shear / Skew (simulates camera perspective)
     if np.random.rand() < 0.5:
         shear_factor = np.random.uniform(-0.15, 0.15)
-        # Affine matrix: [1, a, 0, 0, 1, 0]
         pil_img = pil_img.transform((w, h), Image.AFFINE, (1, shear_factor, 0, 0, 1, 0), resample=Image.BICUBIC)
         
     img = np.array(pil_img, dtype=np.uint8)
@@ -144,13 +142,54 @@ def apply_augmentations(img: np.ndarray) -> np.ndarray:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         img = cv2.erode(img, kernel, iterations=1)
         
-    # 5. Random Blur (Gaussian Blur)
+    # 5. Entrecortes / Fading (horizontal/vertical lines cutting through the character)
+    if np.random.rand() < 0.35:
+        num_cuts = np.random.randint(1, 3)
+        for _ in range(num_cuts):
+            if np.random.rand() < 0.5:
+                # Horizontal cut
+                y = np.random.randint(2, 26)
+                thickness = np.random.choice([1, 2])
+                img[y:y+thickness, :] = 0
+            else:
+                # Vertical cut
+                x = np.random.randint(2, 26)
+                thickness = np.random.choice([1, 2])
+                img[:, x:x+thickness] = 0
+
+    # 6. Manchas / Suciedad (spots: dark spots simulating dirt or white spots simulating peeling paint)
+    if np.random.rand() < 0.35:
+        num_spots = np.random.randint(1, 4)
+        for _ in range(num_spots):
+            spot_x = np.random.randint(0, 28)
+            spot_y = np.random.randint(0, 28)
+            spot_r = np.random.randint(1, 3)
+            # Mostly black spots (dirt) on character, occasionally white spots (peeling/highlights)
+            color = 0 if np.random.rand() < 0.7 else 255
+            cv2.circle(img, (spot_x, spot_y), spot_r, color, -1)
+
+    # 7. Adulteramiento ligero / Artefactos (white lines/shapes simulating screws, plate lines, or severe degradation)
+    if np.random.rand() < 0.25:
+        # Draw a small random line crossing part of the character
+        x1, y1 = np.random.randint(2, 26), np.random.randint(2, 26)
+        x2, y2 = x1 + np.random.randint(-5, 6), y1 + np.random.randint(-5, 6)
+        cv2.line(img, (x1, y1), (x2, y2), 255, thickness=np.random.choice([1, 2]))
+
+    if np.random.rand() < 0.2:
+        # Erase a small block of pixels randomly
+        x = np.random.randint(4, 24)
+        y = np.random.randint(4, 24)
+        w_erase = np.random.randint(2, 5)
+        h_erase = np.random.randint(2, 5)
+        img[y:y+h_erase, x:x+w_erase] = 0
+
+    # 8. Random Blur (Gaussian Blur)
     if np.random.rand() < 0.3:
         ksize = np.random.choice([3, 5])
         img = cv2.GaussianBlur(img, (ksize, ksize), 0)
         
-    # 6. Random Noise
-    if np.random.rand() < 0.2:
+    # 9. Random Noise
+    if np.random.rand() < 0.25:
         noise = np.random.normal(0, np.random.uniform(5, 15), img.shape).astype(np.int16)
         img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
         
@@ -240,19 +279,100 @@ class SyntheticCharDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx], self.labels[idx]
 
-def train(epochs: int = 25, batch_size: int = 128, lr: float = 0.001):
+
+def get_folder_name(ch: str) -> str:
+    """Returns a unique case-safe folder name for each class to support Windows."""
+    if ch.isdigit():
+        return ch
+    elif ch.isupper():
+        return f"upper_{ch}"
+    elif ch.islower():
+        return f"lower_{ch}"
+    else:
+        return f"char_{ord(ch)}"
+
+
+class PhysicalCharDataset(Dataset):
+    """
+    Loads character images from the physical directory structure using the exact EMNIST_LABELS indexing.
+    """
+    def __init__(self, dataset_dir: str, is_train: bool = True):
+        self.dataset_dir = dataset_dir
+        self.is_train = is_train
+        
+        self.image_paths = []
+        self.labels = []
+        
+        # We look up the folders mapping to EMNIST_LABELS index
+        for idx, ch in enumerate(EMNIST_LABELS):
+            folder_name = get_folder_name(ch)
+            class_dir = os.path.join(dataset_dir, folder_name)
+            if not os.path.isdir(class_dir):
+                continue
+            
+            # List all PNG images
+            filenames = [f for f in os.listdir(class_dir) if f.endswith('.png')]
+            
+            # Split into train/val (80% train, 20% validation)
+            # Use deterministic seed per class to ensure no overlap between sets
+            np.random.seed(42 + idx)
+            np.random.shuffle(filenames)
+            
+            split_idx = int(len(filenames) * 0.8)
+            if is_train:
+                selected_files = filenames[:split_idx]
+            else:
+                selected_files = filenames[split_idx:]
+                
+            for fname in selected_files:
+                self.image_paths.append(os.path.join(class_dir, fname))
+                self.labels.append(idx)
+                
+        print(f"[PhysicalCharDataset] Loaded {len(self.image_paths)} samples for {'Training' if is_train else 'Validation'}")
+        
+    def __len__(self):
+        return len(self.image_paths)
+        
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
+        # Load grayscale image
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            img = np.zeros((28, 28), dtype=np.uint8)
+            
+        # Normalize matching EMNIST stats
+        tensor = torch.tensor(img, dtype=torch.float32) / 255.0
+        tensor = (tensor - EMNIST_MEAN) / EMNIST_STD
+        tensor = tensor.unsqueeze(0)  # [1, 28, 28]
+        
+        return tensor, label
+
+
+def train(epochs: int = 25, batch_size: int = 128, lr: float = 0.001, dataset_dir: str = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
     
-    # Download font
-    if not download_font():
-        print("[CRITICAL] Cannot train without FE-Schrift font.")
+    if dataset_dir is None:
+        # Download font for on-the-fly generation
+        if not download_font():
+            print("[CRITICAL] Cannot train without FE-Schrift font.")
+            return
+            
+        # Generate datasets dynamically in-memory
+        train_dataset = SyntheticCharDataset(FONT_PATH, samples_per_class=1200, is_train=True)
+        val_dataset = SyntheticCharDataset(FONT_PATH, samples_per_class=200, is_train=False)
+    else:
+        # Load from disk
+        print(f"[INFO] Loading physical dataset from: {dataset_dir}")
+        train_dataset = PhysicalCharDataset(dataset_dir, is_train=True)
+        val_dataset = PhysicalCharDataset(dataset_dir, is_train=False)
+        
+    if len(train_dataset) == 0:
+        print("[CRITICAL] Train dataset is empty. Check --dataset_dir path.")
         return
         
-    # Generate datasets
-    train_dataset = SyntheticCharDataset(FONT_PATH, samples_per_class=1200, is_train=True)
-    val_dataset = SyntheticCharDataset(FONT_PATH, samples_per_class=200, is_train=False)
-    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
     
@@ -333,6 +453,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=25, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--dataset_dir", type=str, default=None, 
+                        help="Path to physical synthetic dataset (if None, generates dataset dynamically)")
     args = parser.parse_args()
     
-    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, dataset_dir=args.dataset_dir)
+

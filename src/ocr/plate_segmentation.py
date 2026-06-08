@@ -55,16 +55,16 @@ class PlateSegmenter:
         #    - Adaptativo invertido: robusto a iluminacion desigual (sombras, reflejos).
         #    - Adaptativo normal: para placas con texto claro sobre fondo oscuro.
         _, otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        adap_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 6)
-        adap_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 6)
+        adap_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
+        adap_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
 
-        # Limpieza: apertura (quita motas/ruido = los "filtros raros") + cierre (une trazos partidos).
-        open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+        # Limpieza: el cierre (MORPH_CLOSE) une trazos partidos (como la mitad de la H o B).
+        # Un kernel cuadrado o ligeramente más ancho ayuda a unir las lineas horizontales finas.
+        close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
 
         def _clean(b):
-            b = cv2.morphologyEx(b, cv2.MORPH_OPEN,  open_k)   # elimina motas pequenas
-            b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, close_k)  # une caracteres partidos por tornillos
+            # Se omite MORPH_OPEN porque borra trazos finos legítimos (como la raya de la H)
+            b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, close_k)
             return b
 
         otsu_inv = _clean(otsu_inv)
@@ -177,7 +177,7 @@ class PlateSegmenter:
             "Placa Original": plate_img,
             "Gris + CLAHE": gray,
             "Filtro Bilateral": blur,
-            "Binarización (mejor variante)": binary,
+            "Binarización ": binary,
             "Segmentación Final": debug_img
         }
 

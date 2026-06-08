@@ -75,11 +75,12 @@ class InteractiveSpeedTest:
     MODE_HORIZONTAL = 'horizontal'  # Lineas ═ ═  →  miden movimiento arriba/abajo
 
     def __init__(self, camera_index: int, real_distance_m: float,
-                 speed_limit_kmh: float, video_path: str = None):
+                 speed_limit_kmh: float, video_path: str = None, email_all: bool = False):
         self.camera_index    = camera_index
         self.real_distance_m = real_distance_m
         self.speed_limit_kmh = speed_limit_kmh
         self.video_path      = video_path  # None = camara en vivo
+        self.email_all       = email_all
 
         # Orientacion de las lineas de medicion
         self.line_mode = self.MODE_VERTICAL   # Por defecto: lineas verticales
@@ -220,11 +221,14 @@ class InteractiveSpeedTest:
             if inf['id'] == tid and inf['plate'] == '...':
                 inf['plate'] = plate_str
 
-        if speed > self.speed_limit_kmh:
-            # Calcular la sanción en horas usando el sistema difuso Mamdani
-            sanction_hours = self.fine_system.calculate_fine(speed, self.speed_limit_kmh)
+        if speed > self.speed_limit_kmh or self.email_all:
+            # Calcular la sanción en horas usando el sistema difuso Mamdani (solo si hay infracción)
+            sanction_hours = self.fine_system.calculate_fine(speed, self.speed_limit_kmh) if speed > self.speed_limit_kmh else 0.0
             
-            print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Sanción: {sanction_hours:.1f} horas")
+            if speed > self.speed_limit_kmh:
+                print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Sanción: {sanction_hours:.1f} horas")
+            else:
+                print(f"[REGISTRO]   {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h (Correo enviado por --email-all)")
             
             # Recortar la imagen del vehículo con un margen amplio para mostrar la carretera y el entorno
             try:
@@ -262,7 +266,7 @@ class InteractiveSpeedTest:
                 plate_crop=plate_img
             )
         else:
-            print(f"[REGISTRO]   {ts} | Vehiculo #{tid} | Placa: {plate_str}")
+            print(f"[REGISTRO]   {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h")
 
     def _vote_plate(self, tid: int, plate: str) -> str:
         """
@@ -1009,6 +1013,11 @@ def parse_args():
         default=CAMERA_INDEX,
         help=f'Indice de la camara (default: {CAMERA_INDEX}). Ignorado si se usa --video.'
     )
+    parser.add_argument(
+        '--email-all',
+        action='store_true',
+        help='Enviar correo de todos los vehiculos detectados, no solo infractores.'
+    )
     return parser.parse_args()
 
 
@@ -1020,5 +1029,6 @@ if __name__ == "__main__":
         real_distance_m=REAL_DISTANCE_M,
         speed_limit_kmh=SPEED_LIMIT_KMH,
         video_path=args.video,
+        email_all=args.email_all
     )
     test.run()

@@ -49,6 +49,10 @@ REAL_DISTANCE_STEP = 0.5
 
 YOLO_CONF          = 0.30       # Umbral de confianza YOLO
 
+# --- Control de carga del OCR (evita ahogar el sistema con hilos) ---
+OCR_COOLDOWN_S     = 0.25       # Tiempo minimo entre lecturas de OCR de un mismo vehiculo
+MAX_CONCURRENT_OCR = 2          # Maximo de hilos de OCR ejecutandose a la vez
+
 WINDOW_NAME        = "Speed Radar - Deteccion (Q=salir)"
 # =============================================================================
 
@@ -845,9 +849,18 @@ class InteractiveSpeedTest:
                             self._best_vehicle_snapshots[tid]['frame'] = frame.copy()
                             self._best_vehicle_snapshots[tid]['bbox'] = vehicle['bbox']
 
-                    # Votación periódica de OCR (Sin cooldown)
-                    if not touches_border and tid not in self._ocr_running:
+                    # Votación periódica de OCR CON THROTTLE.
+                    # Antes se lanzaba un hilo de OCR en CADA frame por vehiculo ("Sin cooldown"),
+                    # saturando el lock de YOLO y ahogando el sistema (lentitud). Ahora se limita a:
+                    #   - 1 lectura cada OCR_COOLDOWN_S por vehiculo (suficiente para la votacion)
+                    #   - un maximo de MAX_CONCURRENT_OCR hilos de OCR simultaneos
+                    now = time.time()
+                    if (not touches_border
+                            and tid not in self._ocr_running
+                            and len(self._ocr_running) < MAX_CONCURRENT_OCR
+                            and now - self._last_ocr_time.get(tid, 0.0) >= OCR_COOLDOWN_S):
                         self._ocr_running.add(tid)
+                        self._last_ocr_time[tid] = now
                         t = threading.Thread(
                             target=self._run_ocr_vote_async,
                             args=(tid, frame.copy(), vehicle['bbox']),

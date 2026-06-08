@@ -42,6 +42,13 @@ EMNIST_LABELS = (
     'abdefghnqrt'
 )
 
+# Numero de clases validas para placas: digitos (0-9) + mayusculas (A-Z) = 36.
+# Las clases 36-46 son minusculas (a,b,d,e,f,g,h,n,q,r,t) que NUNCA aparecen en una
+# placa y que ademas se confunden con caracteres validos (6<->b, 9<->q/g, 0<->d, etc.).
+# En inferencia enmascaramos esas clases para que la CNN solo pueda elegir entre las 36
+# validas, eliminando esa familia de errores sin necesidad de reentrenar.
+PLATE_VALID_CLASSES = 36
+
 # ---------------------------------------------------------------------------
 # Correcciones posicionales para placas ecuatorianas (formato AAA-NNNN)
 # La CNN confunde ciertos caracteres; esta tabla corrige segun la posicion.
@@ -297,7 +304,11 @@ class PlateOCR:
 
         with torch.no_grad():
             logits = self.model(tensor)               # [1, 47]
-            probs  = F.softmax(logits, dim=1)         # [1, 47]
+            # Enmascarar las clases minusculas (36-46): no existen en placas y se
+            # confunden con digitos/mayusculas. Al ponerlas en -inf, la softmax les
+            # asigna probabilidad 0 y el modelo solo puede elegir entre las 36 validas.
+            logits[:, PLATE_VALID_CLASSES:] = float('-inf')
+            probs  = F.softmax(logits, dim=1)         # [1, 47] (las 11 ultimas = 0)
             conf, pred_idx = probs.max(dim=1)
 
         char = idx_to_char(pred_idx.item())

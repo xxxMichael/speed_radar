@@ -134,9 +134,10 @@ class InteractiveSpeedTest:
         self._ocr_running: set[int] = set()
         # Ultimo tiempo de escaneo por vehiculo (para reintentos dinamicos)
         self._last_ocr_time: dict[int, float] = {}
-        # Historial de mejores etapas de segmentacion para generar un unico HTML al final
+        # Historial de mejores etapas de segmentacion para generar un unico HTML al final.
+        # Se elige la captura MAS NITIDA (no la mas cercana), medida por nitidez de enfoque.
         self.best_plate_stages: dict[int, dict] = {}
-        self.best_plate_width: dict[int, int] = {}
+        self.best_plate_focus: dict[int, float] = {}
 
         # Snapshots para procesar el mejor frame en salida
         self._best_vehicle_snapshots: dict[int, dict] = {} # {track_id: {'area': float, 'frame': np.ndarray, 'bbox': list}}
@@ -149,6 +150,28 @@ class InteractiveSpeedTest:
     # OCR de placas (hilo en segundo plano)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _focus_score(gray: 'np.ndarray') -> float:
+        """
+        Mide la nitidez de una imagen con la varianza del Laplaciano.
+        Un valor alto = bordes definidos (nitida); un valor bajo = imagen movida/borrosa.
+        Sirve para quedarnos con la captura mas clara de la placa para el HTML.
+        """
+        if gray is None or gray.size == 0:
+            return 0.0
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _update_best_stages(self, tid: int, stages_dict: dict):
+        """Conserva las etapas de la captura mas NITIDA vista para este vehiculo."""
+        if not stages_dict:
+            return
+        # La primera etapa es la imagen en gris de la placa (orden de insercion garantizado).
+        gray_stage = next(iter(stages_dict.values()))
+        focus = self._focus_score(gray_stage)
+        if focus > self.best_plate_focus.get(tid, 0.0):
+            self.best_plate_focus[tid] = focus
+            self.best_plate_stages[tid] = stages_dict
+
     def _run_ocr_vote_async(self, tid: int, frame_copy: 'np.ndarray', bbox: list):
         """Ejecuta el OCR periódicamente para acumular votos de la placa."""
         try:
@@ -157,14 +180,13 @@ class InteractiveSpeedTest:
                 if not hasattr(self, 'plate_crops'):
                     self.plate_crops = {}
                 self.plate_crops[tid] = debug_img
-                
-                # Guardar el stages_dict solo si es la captura más cercana (imagen más ancha)
-                if stages_dict and "Gris Original" in stages_dict:
-                    current_width = stages_dict["Gris Original"].shape[1]
-                    if current_width > self.best_plate_width.get(tid, 0):
-                        self.best_plate_width[tid] = current_width
-                        self.best_plate_stages[tid] = stages_dict
-                
+
+                # Conservar la captura MAS NITIDA (no la mas cercana) para el HTML:
+                # el frame mas cercano suele venir movido (motion blur), aunque la
+                # votacion en vivo lo tolere. Elegimos por nitidez para que el HTML
+                # refleje la imagen realmente legible.
+                self._update_best_stages(tid, stages_dict)
+
             # Registrar voto (incluso vacio para no colgar)
             plate_str = self._vote_plate(tid, plate if plate else '')
             self.plates[tid] = plate_str
@@ -195,13 +217,9 @@ class InteractiveSpeedTest:
                     if not hasattr(self, 'plate_crops'):
                         self.plate_crops = {}
                     self.plate_crops[tid] = debug_img
-                    
-                    if stages_dict and "Gris Original" in stages_dict:
-                        current_width = stages_dict["Gris Original"].shape[1]
-                        if current_width > self.best_plate_width.get(tid, 0):
-                            self.best_plate_width[tid] = current_width
-                            self.best_plate_stages[tid] = stages_dict
-                            
+
+                    self._update_best_stages(tid, stages_dict)
+
                 plate_str = self._vote_plate(tid, plate if plate else '')
                 self.plates[tid] = plate_str
             except Exception as e:
@@ -216,7 +234,7 @@ class InteractiveSpeedTest:
             
         # Limpiar diccionarios temporales
         self.best_plate_stages.pop(tid, None)
-        self.best_plate_width.pop(tid, None)
+        self.best_plate_focus.pop(tid, None)
 
         # Registrar voto y obtener placa ganadora por votacion
         ts = time.strftime("%H:%M:%S")

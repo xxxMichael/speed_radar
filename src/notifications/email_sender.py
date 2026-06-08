@@ -38,7 +38,7 @@ def load_env():
 # Ejecutar carga al importar el módulo
 load_env()
 
-def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: float, fine_amount: float, frame_crop=None):
+def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: float, sanction_hours: float, vehicle_crop=None, plate_crop=None):
     """
     Función interna ejecutada en un hilo separado para evitar colgar el video en tiempo real.
     """
@@ -64,7 +64,7 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
 
     # Crear el objeto de mensaje MIME Multipart
     msg = MIMEMultipart('related')
-    msg['Subject'] = f"🚔 ALERTA DE INFRACCIÓN: Vehículo #{vehicle_id} - Placa {plate}"
+    msg['Subject'] = f"🚔 ALERTA DE INFRACCIÓN: Placa {plate}"
     msg['From'] = smtp_user
     msg['To'] = recipient
 
@@ -163,6 +163,7 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
                 height: auto;
                 border-radius: 4px;
                 border: 2px solid #b0bec5;
+                margin-bottom: 10px;
             }}
             .footer {{
                 background-color: #37474f;
@@ -181,15 +182,11 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
             </div>
             <div class="content">
                 <div class="alert-box">
-                    <h2>Multa Estimada por Lógica Difusa</h2>
-                    <p>El sistema difuso Mamdani ha calculado la severidad basada en el exceso de velocidad y el límite de la vía.</p>
+                    <h2>Sanción de Ingreso por Lógica Difusa</h2>
+                    <p>El sistema difuso Mamdani ha calculado el tiempo de suspensión basado en el exceso de velocidad en el campus universitario.</p>
                 </div>
                 
                 <table>
-                    <tr>
-                        <th>ID de Registro</th>
-                        <td>#{vehicle_id}</td>
-                    </tr>
                     <tr>
                         <th>Placa del Vehículo</th>
                         <td><strong>{plate}</strong></td>
@@ -211,15 +208,22 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
                         <td>{hora_actual}</td>
                     </tr>
                     <tr>
-                        <th>Monto Multa Estimado</th>
-                        <td class="fine-value">${fine_amount:.2f} USD</td>
+                        <th>Suspensión de Ingreso Sugerida</th>
+                        <td class="fine-value">{sanction_hours:.1f} horas</td>
                     </tr>
                 </table>
 
-                {"" if frame_crop is None else f'''
+                {"" if vehicle_crop is None else f'''
                 <div class="evidence">
-                    <h3 style="margin-top:0; color:#455a64; font-size: 15px;">Evidencia Fotográfica de la Placa</h3>
-                    <img src="cid:evidence_image" alt="Captura de placa vehicular" />
+                    <h3 style="margin-top:0; color:#455a64; font-size: 15px;">Evidencia del Vehículo</h3>
+                    <img src="cid:vehicle_image" alt="Captura general del vehiculo" />
+                </div>
+                '''}
+                
+                {"" if plate_crop is None else f'''
+                <div class="evidence">
+                    <h3 style="margin-top:0; color:#455a64; font-size: 15px;">Detalle de la Placa Analizada</h3>
+                    <img src="cid:plate_image" alt="Recorte de placa" />
                 </div>
                 '''}
             </div>
@@ -235,19 +239,31 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
     # Adjuntar HTML
     msg.attach(MIMEText(html_body, 'html'))
 
-    # Adjuntar la imagen si está disponible
-    if frame_crop is not None:
+    # Adjuntar la imagen del vehiculo si está disponible
+    if vehicle_crop is not None:
         try:
-            # Codificar imagen cv2 en JPG
-            ret, buf = cv2.imencode('.jpg', frame_crop)
+            ret, buf = cv2.imencode('.jpg', vehicle_crop)
             if ret:
                 img_data = buf.tobytes()
-                mime_img = MIMEImage(img_data, name='evidence.jpg')
-                mime_img.add_header('Content-ID', '<evidence_image>')
-                mime_img.add_header('Content-Disposition', 'inline', filename='evidence.jpg')
+                mime_img = MIMEImage(img_data, name='vehicle.jpg')
+                mime_img.add_header('Content-ID', '<vehicle_image>')
+                mime_img.add_header('Content-Disposition', 'inline', filename='vehicle.jpg')
                 msg.attach(mime_img)
         except Exception as e:
-            print(f"[SMTP WARNING] No se pudo adjuntar la imagen al correo: {e}")
+            print(f"[SMTP WARNING] No se pudo adjuntar la imagen del vehículo: {e}")
+
+    # Adjuntar la imagen de la placa si está disponible
+    if plate_crop is not None:
+        try:
+            ret, buf = cv2.imencode('.jpg', plate_crop)
+            if ret:
+                img_data = buf.tobytes()
+                mime_img = MIMEImage(img_data, name='plate.jpg')
+                mime_img.add_header('Content-ID', '<plate_image>')
+                mime_img.add_header('Content-Disposition', 'inline', filename='plate.jpg')
+                msg.attach(mime_img)
+        except Exception as e:
+            print(f"[SMTP WARNING] No se pudo adjuntar la imagen de la placa: {e}")
 
     # Envío mediante smtplib
     try:
@@ -257,12 +273,12 @@ def _send_email_worker(vehicle_id: int, plate: str, speed: float, speed_limit: f
         server.login(smtp_user, smtp_password)
         server.sendmail(smtp_user, recipient, msg.as_string())
         server.quit()
-        print(f"[SMTP] Correo enviado exitosamente para el vehiculo #{vehicle_id} (Placa: {plate}, Multa: ${fine_amount:.2f})")
+        print(f"[SMTP] Correo enviado exitosamente para el vehiculo #{vehicle_id} (Placa: {plate}, Sanción: {sanction_hours:.1f} h)")
     except Exception as e:
         print(f"[SMTP ERROR] Falla al enviar el correo: {e}")
 
 
-def send_infraction_email(vehicle_id: int, plate: str, speed: float, speed_limit: float, fine_amount: float, frame_crop=None):
+def send_infraction_email(vehicle_id: int, plate: str, speed: float, speed_limit: float, sanction_hours: float, vehicle_crop=None, plate_crop=None):
     """
     Función pública para disparar el correo de alerta.
     Inicia un hilo en segundo plano de manera inmediata para no interferir con el rendimiento del radar.
@@ -270,7 +286,7 @@ def send_infraction_email(vehicle_id: int, plate: str, speed: float, speed_limit
     print(f"[SMTP] Iniciando envío de correo de alerta para Vehículo #{vehicle_id}...")
     t = threading.Thread(
         target=_send_email_worker,
-        args=(vehicle_id, plate, speed, speed_limit, fine_amount, frame_crop),
+        args=(vehicle_id, plate, speed, speed_limit, sanction_hours, vehicle_crop, plate_crop),
         daemon=True
     )
     t.start()

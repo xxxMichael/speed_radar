@@ -234,10 +234,10 @@ class PlateDetector:
 
             h, w = vehicle_crop.shape[:2]
 
-            # Tomar la deteccion con mayor area (suele ser la placa principal)
+            # Tomar la deteccion con mayor confianza (en lugar de mayor area)
             best_crop = None
             best_bbox = None
-            best_area = 0
+            best_conf_score = 0.0
 
             for box in boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -246,10 +246,8 @@ class PlateDetector:
                 if conf < self.conf_threshold:
                     continue
 
-                area = (x2 - x1) * (y2 - y1)
-
-                if area > best_area:
-                    best_area = area
+                if conf > best_conf_score:
+                    best_conf_score = conf
                     # Padding de 2px para no cortar bordes de caracteres
                     pad = 2
                     rx1 = max(0, x1 - pad)

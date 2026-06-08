@@ -31,56 +31,66 @@ class PlateSegmenter:
         if plate_img is None or plate_img.size == 0:
             return [], None
 
-        # 1. Redimensionar si la placa es muy pequeña (mejora el OCR)
+        # 1. Estandarizar el tamaño de la placa a una altura fija para consistencia de parámetros
         ph, pw = plate_img.shape[:2]
-        if pw < 200:
-            scale  = 200.0 / pw
-            plate_img = cv2.resize(plate_img, (200, int(ph * scale)), interpolation=cv2.INTER_CUBIC)
+        target_h = 100
+        scale = target_h / ph
+        plate_img = cv2.resize(plate_img, (int(pw * scale), target_h), interpolation=cv2.INTER_CUBIC)
 
         # 2. Convertir a escala de grises
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
 
         # 3. CLAHE: mejora local del contraste (critico para placas con iluminacion desigual)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         gray  = clahe.apply(gray)
 
-        # 4. Suavizado ligero
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        # 4. Suavizado ligero (Bilateral filter reduce ruido pero preserva bordes)
+        blur = cv2.bilateralFilter(gray, 11, 17, 17)
 
-        # 5. Binarizacion dual: probamos Otsu normal e inverso y elegimos el que da mas caracteres.
-        # Las placas ecuatorianas son blancas con texto negro → BINARY_INV da letras blancas.
-        _, binary_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        _, binary_nor = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY     + cv2.THRESH_OTSU)
+        # 5. Binarizacion adaptativa: ideal para fondos con contraste pobre (placas naranja/amarillo) o luces.
+        # Bloque de 19, constante C de 10 funciona bien para texto.
+        binary_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 10)
+        binary_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 19, 10)
 
         # Operacion morfologica: cierre pequeno para unir partes de letras rotas
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         binary_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_CLOSE, kernel)
         binary_nor = cv2.morphologyEx(binary_nor, cv2.MORPH_CLOSE, kernel)
 
         def _extract_contours(binary):
             """Retorna lista de (x, y, w, h) de caracteres validos, filtrando bordes e interiores."""
             h_img, w_img = binary.shape
-            # Altura minima: 20% de la imagen; maxima: 95%
-            min_h = max(5, int(h_img * 0.20))
-            max_h = int(h_img * 0.97)
+            # Los caracteres reales de la placa ocupan la mayor parte del espacio vertical.
+            # Incrementamos min_h al 30% (antes 40%) para evitar perder letras si YOLO recorta con mucho margen,
+            # pero manteniendolo suficiente para descartar palabras pequeñas como "ECUADOR".
+            min_h = max(10, int(h_img * 0.30))
+            max_h = int(h_img * 0.95)
             contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             valid = []
             for cnt in contours:
                 x, y, w, h = cv2.boundingRect(cnt)
-                # Evitar contorno del borde exterior de la placa o marcos grandes
-                if w > w_img * 0.85 or h > h_img * 0.85:
+                
+                # Evitar contorno del borde exterior o líneas horizontales/verticales del marco
+                if w > w_img * 0.85 or h > h_img * 0.95:
                     continue
-                if not (min_h < h < max_h):
+                
+                # Filtrar si el contorno está pegado al borde superior o inferior (suele ser el borde de la placa)
+                if y < 2 or (y + h) > h_img - 2:
+                    # Si toca el borde y es muy ancho, probablemente sea el marco
+                    if w > w_img * 0.5:
+                        continue
+                        
+                if not (min_h <= h <= max_h):
                     continue
                 if w < 3:
                     continue
                 aspect = w / float(h)
-                # Rango de aspecto ampliado: cubre letras anchas (B, P, D) y el guion
-                if 0.15 < aspect < 2.5:
+                # Rango de aspecto más relajado para letras con perspectiva (0.15 a 1.5)
+                # Un carácter no suele ser 3 veces más ancho que alto.
+                if 0.15 < aspect < 1.5:
                     valid.append((x, y, w, h))
             
-            # Eliminar contornos internos (anidados/agujeros como el de la 'O' o 'B')
-            # Si un contorno esta completamente contenido dentro de otro mas grande, lo descartamos
+            # Eliminar contornos internos (agujeros como el de la 'O' o 'B')
             filtered_valid = []
             for box in valid:
                 x, y, w, h = box
@@ -127,6 +137,13 @@ class PlateSegmenter:
             x_end   = min(w_img, x + w + pad)
             y_end   = min(h_img, y + h + pad)
             char_crop    = binary[y_start:y_end, x_start:x_end]
+            
+            # Asegurar que el caracter sea letra blanca sobre fondo negro (para la CNN)
+            # Analizamos los bordes del recorte. Si la mayoría es blanco, invertimos.
+            borders = np.concatenate([char_crop[0,:], char_crop[-1,:], char_crop[:,0], char_crop[:,-1]])
+            if np.mean(borders) > 127:
+                char_crop = cv2.bitwise_not(char_crop)
+                
             char_resized = self._resize_with_pad(char_crop, self.target_size)
             char_crops.append(char_resized)
 

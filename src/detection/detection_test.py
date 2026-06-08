@@ -152,7 +152,11 @@ class InteractiveSpeedTest:
             speed: Velocidad calculada en km/h.
         """
         try:
-            plate, _ = self.plate_ocr.read_plate(frame_copy, bbox)
+            plate, debug_img = self.plate_ocr.read_plate(frame_copy, bbox)
+            if debug_img is not None:
+                if not hasattr(self, 'plate_crops'):
+                    self.plate_crops = {}
+                self.plate_crops[tid] = debug_img
         except Exception as e:
             plate = ''
             print(f"[OCR] Error en vehiculo #{tid}: {e}")
@@ -170,10 +174,10 @@ class InteractiveSpeedTest:
                 inf['plate'] = plate_str
 
         if speed > self.speed_limit_kmh:
-            # Calcular la multa usando el sistema difuso Mamdani
-            fine_amount = self.fine_system.calculate_fine(speed, self.speed_limit_kmh)
+            # Calcular la sanción en horas usando el sistema difuso Mamdani
+            sanction_hours = self.fine_system.calculate_fine(speed, self.speed_limit_kmh)
             
-            print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Multa Difusa: ${fine_amount:.2f} USD")
+            print(f"[INFRACCION] {ts} | Vehiculo #{tid} | Placa: {plate_str} | Velocidad: {speed:.1f} km/h | Sanción: {sanction_hours:.1f} horas")
             
             # Recortar la imagen del vehículo con un margen amplio para mostrar la carretera y el entorno
             try:
@@ -198,14 +202,17 @@ class InteractiveSpeedTest:
                 vehicle_crop = None
                 print(f"[WARNING] No se pudo recortar la evidencia para vehiculo #{tid}: {e}")
             
+            plate_img = getattr(self, 'plate_crops', {}).get(tid, None)
+            
             # Disparar correo asíncrono
             send_infraction_email(
                 vehicle_id=tid,
                 plate=plate_str,
                 speed=speed,
                 speed_limit=self.speed_limit_kmh,
-                fine_amount=fine_amount,
-                frame_crop=vehicle_crop
+                sanction_hours=sanction_hours,
+                vehicle_crop=vehicle_crop,
+                plate_crop=plate_img
             )
         else:
             print(f"[REGISTRO]   {ts} | Vehiculo #{tid} | Placa: {plate_str}")
@@ -567,7 +574,9 @@ class InteractiveSpeedTest:
                     (10, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 100, 255), 1)
 
         for i, inf in enumerate(reversed(log)):
-            txt = f"  #{inf['id']:>3}  {inf['speed']:>6.1f} km/h   {inf['time']}"
+            # Retirar ID y mostrar placa, velocidad y hora
+            pl = inf.get('plate', '...')
+            txt = f"  Placa: {pl:<8}  {inf['speed']:>6.1f} km/h   {inf['time']}"
             cv2.putText(frame, txt,
                         (10, y0 + 14 + (i + 1) * 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 60, 255), 1)

@@ -174,6 +174,7 @@ class PlateSegmenter:
             char_crops.append(char_resized)
 
         stages_dict = {
+            "Placa Original": plate_img,
             "Gris + CLAHE": gray,
             "Filtro Bilateral": blur,
             "Binarización (mejor variante)": binary,

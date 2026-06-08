@@ -188,10 +188,14 @@ class PlateDetector:
                                o None si no se detecto.
         """
         if vehicle_crop is None or vehicle_crop.size == 0:
+            self.last_detection_method = "None"
+            self.last_detection_conf = 0.0
             return None, None
 
         h, w = vehicle_crop.shape[:2]
         if h < 10 or w < 10:
+            self.last_detection_method = "None"
+            self.last_detection_conf = 0.0
             return None, None
 
         # --- Deteccion con YOLOv8 ---
@@ -199,8 +203,14 @@ class PlateDetector:
             plate_crop, plate_bbox = self._detect_with_yolo(vehicle_crop)
             if plate_crop is not None:
                 return plate_crop, plate_bbox
+            else:
+                # Si tenemos el modelo especializado y no detectó nada, confiamos en YOLO y abortamos
+                if not self._is_base_model:
+                    self.last_detection_method = "None (YOLO rejected)"
+                    self.last_detection_conf = 0.0
+                    return None, None
 
-        # --- Fallback heuristico ---
+        # --- Fallback heuristico (Solo si YOLO no está cargado o es el modelo base sin entrenamiento) ---
         return self._heuristic_fallback(vehicle_crop)
 
     def _detect_with_yolo(self, vehicle_crop: np.ndarray) -> tuple[np.ndarray | None, list | None]:
@@ -221,7 +231,7 @@ class PlateDetector:
                     vehicle_crop,
                     conf=self.conf_threshold,
                     verbose=False,
-                    imgsz=640,    # Resolucion estandar para detectar objetos pequenos/lejanos
+                    imgsz=480,    # Reducido de 640 a 480 para optimizar tráfico cercano/lento
                     device=self.device
                 )
 
@@ -257,6 +267,9 @@ class PlateDetector:
                     best_crop = vehicle_crop[ry1:ry2, rx1:rx2]
                     best_bbox = [rx1, ry1, rx2, ry2]
 
+            if best_crop is not None:
+                self.last_detection_method = "YOLO"
+                self.last_detection_conf = best_conf_score
             return best_crop, best_bbox
 
         except Exception as e:
@@ -311,6 +324,8 @@ class PlateDetector:
                     best_bbox = [bx1, by1, bx2, by2]
 
         if best_crop is not None:
+            self.last_detection_method = "Heuristic (Threshold)"
+            self.last_detection_conf = 0.0
             return best_crop, best_bbox
 
         # --- Estrategia 2: Busqueda de bordes en la mitad inferior ---
@@ -345,11 +360,16 @@ class PlateDetector:
                     best_bbox  = [x1, search_y+y1, x2, search_y+y2]
 
         if best_crop is not None:
+            self.last_detection_method = "Heuristic (Edges)"
+            self.last_detection_conf = 0.0
             return best_crop, best_bbox
 
         # --- Fallback final: franja inferior del vehiculo ---
         fallback_h = max(20, h // 4)
         fc = vehicle_crop[h-fallback_h:, :]
+        
+        self.last_detection_method = "Heuristic (Blind Crop)"
+        self.last_detection_conf = 0.0
         return fc, None
 
     def draw_detection(self, vehicle_crop: np.ndarray, plate_bbox: list | None) -> np.ndarray:

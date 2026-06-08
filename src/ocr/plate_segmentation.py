@@ -16,20 +16,21 @@ class PlateSegmenter:
         """
         self.target_size = target_size
 
-    def segment_characters(self, plate_img):
+    def segment_characters(self, plate_img: np.ndarray) -> tuple[list[np.ndarray], np.ndarray, dict]:
         """
-        Segmenta los caracteres de la imagen de una placa.
+        Toma el recorte de la placa a color, lo binariza, aisla los contornos
+        de cada caracter, los ordena de izquierda a derecha, y los recorta.
         
         Args:
-            plate_img (numpy.ndarray): Imagen BGR de la placa recortada.
+            plate_img: Imagen BGR de la placa recortada.
             
         Returns:
-            list: Lista de imágenes (numpy.ndarray) de los caracteres segmentados, 
-                  en escala de grises y redimensionados a target_size, ordenados de izquierda a derecha.
-            numpy.ndarray: Imagen de depuración con los contornos dibujados.
+            - Lista de imagenes de los caracteres (28x28, escala de grises, fondo negro).
+            - Imagen de debug con bounding boxes dibujados sobre la placa original.
+            - Diccionario con las imagenes de cada fase (gris, blur, binarizacion).
         """
         if plate_img is None or plate_img.size == 0:
-            return [], None
+            return [], None, {}
 
         # 1. Estandarizar el tamaño de la placa a una altura fija para consistencia de parámetros
         ph, pw = plate_img.shape[:2]
@@ -48,12 +49,12 @@ class PlateSegmenter:
         blur = cv2.bilateralFilter(gray, 11, 17, 17)
 
         # 5. Binarizacion adaptativa: ideal para fondos con contraste pobre (placas naranja/amarillo) o luces.
-        # Bloque de 19, constante C de 10 funciona bien para texto.
-        binary_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 10)
-        binary_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 19, 10)
+        # Bloque de 15, constante C de 6 funciona bien para texto, manteniendo trazos finos y gruesos.
+        binary_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 6)
+        binary_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 6)
 
-        # Operacion morfologica: cierre pequeno para unir partes de letras rotas
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        # Operacion morfologica: cierre un poco mas alto para unir caracteres partidos por tornillos
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
         binary_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_CLOSE, kernel)
         binary_nor = cv2.morphologyEx(binary_nor, cv2.MORPH_CLOSE, kernel)
 
@@ -75,19 +76,25 @@ class PlateSegmenter:
                     continue
                 
                 # Filtrar si el contorno está pegado al borde superior o inferior (suele ser el borde de la placa)
-                if y < 2 or (y + h) > h_img - 2:
+                if y <= 2 or (y + h) >= h_img - 2:
                     # Si toca el borde y es muy ancho, probablemente sea el marco
                     if w > w_img * 0.5:
                         continue
+                        
+                # Filtrar si está tocando los bordes laterales (evita la franja negra lateral).
+                # Usamos un porcentaje del ancho en lugar de pixeles absolutos para placas lejanas.
+                margin_x = max(3, int(w_img * 0.04))
+                if x <= margin_x or (x + w) >= w_img - margin_x:
+                    continue
                         
                 if not (min_h <= h <= max_h):
                     continue
                 if w < 3:
                     continue
                 aspect = w / float(h)
-                # Rango de aspecto más relajado para letras con perspectiva (0.15 a 1.5)
-                # Un carácter no suele ser 3 veces más ancho que alto.
-                if 0.15 < aspect < 1.5:
+                # Rango de aspecto más relajado para letras con perspectiva.
+                # Subimos el mínimo a 0.18 para evitar líneas de ruido que se leen como 'I'.
+                if 0.18 < aspect < 1.5:
                     valid.append((x, y, w, h))
             
             # Eliminar contornos internos (agujeros como el de la 'O' o 'B')
@@ -147,7 +154,14 @@ class PlateSegmenter:
             char_resized = self._resize_with_pad(char_crop, self.target_size)
             char_crops.append(char_resized)
 
-        return char_crops, debug_img
+        stages_dict = {
+            "Gris Original": gray,
+            "Filtro Bilateral": blur,
+            "Binarización Adaptativa": binary,
+            "Segmentación Final": debug_img
+        }
+
+        return char_crops, debug_img, stages_dict
 
     def _resize_with_pad(self, img, size):
         """
@@ -157,9 +171,12 @@ class PlateSegmenter:
         h, w = img.shape[:2]
         target_w, target_h = size
         
-        # Calcular factor de escala
-        scale = min(target_w / w, target_h / h)
-        new_w, new_h = int(w * scale), int(h * scale)
+        # Calcular factor de escala para dejar un margen (ej: max dimension 20)
+        # EMNIST y el modelo sintético usan caracteres centrados dejando ~4px de margen por lado
+        inner_w, inner_h = target_w - 8, target_h - 8
+        
+        scale = min(inner_w / float(w), inner_h / float(h))
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
         
         resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         

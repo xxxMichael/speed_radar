@@ -290,3 +290,92 @@ def send_infraction_email(vehicle_id: int, plate: str, speed: float, speed_limit
         daemon=True
     )
     t.start()
+
+
+def _send_test_email_worker(plate: str, vehicle_crop=None, plate_crop=None, det_method="Desconocido", det_conf=0.0, avg_char_conf=0.0):
+    """
+    Worker interno para enviar el correo de prueba OCR sin formato de infracción.
+    """
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port_str = os.getenv("SMTP_PORT")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    recipient = os.getenv("EMAIL_RECIPIENT")
+
+    if not all([smtp_server, smtp_port_str, smtp_user, smtp_password, recipient]):
+        print("[SMTP ERROR] Faltan variables de configuración en el archivo .env para el envío de correos.")
+        return
+
+    try:
+        smtp_port = int(smtp_port_str)
+    except ValueError:
+        return
+
+    hora_actual = time.strftime("%d/%m/%Y %H:%M:%S")
+
+    msg = MIMEMultipart('related')
+    msg['Subject'] = f"📷 Prueba de Detección OCR: Placa {plate}"
+    msg['From'] = smtp_user
+    msg['To'] = recipient
+
+    html_body = f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: sans-serif; color: #333; }}
+            .container {{ max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ccc; border-radius: 8px; }}
+            h2 {{ color: #2980b9; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>Test de Sistema OCR en Tiempo Real</h2>
+            <p>Se ha detectado una placa en la cámara web.</p>
+            <ul>
+                <li><strong>Placa leída:</strong> {plate}</li>
+                <li><strong>Fecha y Hora:</strong> {hora_actual}</li>
+                <li><strong>Método de Detección:</strong> {det_method}</li>
+                <li><strong>Confianza Detección:</strong> {det_conf:.1%}</li>
+                <li><strong>Confianza Promedio Letras:</strong> {avg_char_conf:.1%}</li>
+            </ul>
+            {"" if vehicle_crop is None else '<p><strong>Vehículo:</strong></p><img src="cid:vehicle_image" width="400" />'}
+            {"" if plate_crop is None else '<p><strong>Placa (Debug OCR):</strong></p><img src="cid:plate_image" width="200" />'}
+        </div>
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(html_body, 'html'))
+
+    if vehicle_crop is not None:
+        ret, buf = cv2.imencode('.jpg', vehicle_crop)
+        if ret:
+            img_data = buf.tobytes()
+            mime_img = MIMEImage(img_data, name='vehicle.jpg')
+            mime_img.add_header('Content-ID', '<vehicle_image>')
+            mime_img.add_header('Content-Disposition', 'inline', filename='vehicle.jpg')
+            msg.attach(mime_img)
+
+    if plate_crop is not None:
+        ret, buf = cv2.imencode('.jpg', plate_crop)
+        if ret:
+            img_data = buf.tobytes()
+            mime_img = MIMEImage(img_data, name='plate.jpg')
+            mime_img.add_header('Content-ID', '<plate_image>')
+            mime_img.add_header('Content-Disposition', 'inline', filename='plate.jpg')
+            msg.attach(mime_img)
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, recipient, msg.as_string())
+        server.quit()
+        print(f"[SMTP] Correo de prueba enviado para placa: {plate}")
+    except Exception as e:
+        print(f"[SMTP ERROR] {e}")
+
+
+def send_ocr_test_email(plate: str, vehicle_crop=None, plate_crop=None, det_method="Desconocido", det_conf=0.0, avg_char_conf=0.0):
+    t = threading.Thread(target=_send_test_email_worker, args=(plate, vehicle_crop, plate_crop, det_method, det_conf, avg_char_conf), daemon=True)
+    t.start()
+

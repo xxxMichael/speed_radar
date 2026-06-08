@@ -9,3 +9,4 @@ __pycache__/
 *$py.class
 scratch/
 .env
+debug_htmls/

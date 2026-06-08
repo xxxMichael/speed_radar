@@ -128,6 +128,9 @@ class InteractiveSpeedTest:
         self._ocr_running: set[int] = set()
         # Ultimo tiempo de escaneo por vehiculo (para reintentos dinamicos)
         self._last_ocr_time: dict[int, float] = {}
+        # Historial de mejores etapas de segmentacion para generar un unico HTML al final
+        self.best_plate_stages: dict[int, dict] = {}
+        self.best_plate_width: dict[int, int] = {}
 
         # Snapshots para procesar el mejor frame en salida
         self._best_vehicle_snapshots: dict[int, dict] = {} # {track_id: {'area': float, 'frame': np.ndarray, 'bbox': list}}
@@ -140,35 +143,79 @@ class InteractiveSpeedTest:
     # OCR de placas (hilo en segundo plano)
     # ------------------------------------------------------------------
 
-    def _run_ocr_async(self, tid: int, frame_copy: 'np.ndarray', bbox: list, speed: float):
-        """
-        Ejecuta el OCR de la placa en un hilo separado para no bloquear el video.
-        Al terminar, registra la placa e imprime el resultado en consola.
-
-        Args:
-            tid: track_id del vehiculo.
-            frame_copy: Copia del frame actual (para que no cambie mientras se procesa).
-            bbox: Bounding box [x1, y1, x2, y2] del vehiculo.
-            speed: Velocidad calculada en km/h.
-        """
+    def _run_ocr_vote_async(self, tid: int, frame_copy: 'np.ndarray', bbox: list):
+        """Ejecuta el OCR periódicamente para acumular votos de la placa."""
         try:
-            plate, debug_img = self.plate_ocr.read_plate(frame_copy, bbox)
+            plate, debug_img, stages_dict = self.plate_ocr.read_plate(frame_copy, bbox)
             if debug_img is not None:
                 if not hasattr(self, 'plate_crops'):
                     self.plate_crops = {}
                 self.plate_crops[tid] = debug_img
+                
+                # Guardar el stages_dict solo si es la captura más cercana (imagen más ancha)
+                if stages_dict and "Gris Original" in stages_dict:
+                    current_width = stages_dict["Gris Original"].shape[1]
+                    if current_width > self.best_plate_width.get(tid, 0):
+                        self.best_plate_width[tid] = current_width
+                        self.best_plate_stages[tid] = stages_dict
+                
+            # Registrar voto (incluso vacio para no colgar)
+            plate_str = self._vote_plate(tid, plate if plate else '')
+            self.plates[tid] = plate_str
+            
+            # Actualizar log en pantalla
+            for inf in self.infraction_log:
+                if inf['id'] == tid and inf['plate'] == '...':
+                    inf['plate'] = plate_str
+                    
         except Exception as e:
-            plate = ''
-            print(f"[OCR] Error en vehiculo #{tid}: {e}")
+            print(f"[OCR Vote] Error en vehiculo #{tid}: {e}")
         finally:
             self._ocr_running.discard(tid)
 
+    def _run_ocr_async(self, tid: int, frame_copy: 'np.ndarray', bbox: list, speed: float):
+        """
+        Finaliza el proceso para el vehiculo que sale de la pantalla.
+        Si no se leyó la placa, lo intenta una vez mas.
+        Luego envía el correo.
+        """
+        plate_str = self.plates.get(tid, '')
+        
+        # Si la votación no logró nada o el vehiculo fue muy rapido, intentar OCR una vez mas
+        if not plate_str or plate_str == '???':
+            try:
+                plate, debug_img, stages_dict = self.plate_ocr.read_plate(frame_copy, bbox)
+                if debug_img is not None:
+                    if not hasattr(self, 'plate_crops'):
+                        self.plate_crops = {}
+                    self.plate_crops[tid] = debug_img
+                    
+                    if stages_dict and "Gris Original" in stages_dict:
+                        current_width = stages_dict["Gris Original"].shape[1]
+                        if current_width > self.best_plate_width.get(tid, 0):
+                            self.best_plate_width[tid] = current_width
+                            self.best_plate_stages[tid] = stages_dict
+                            
+                plate_str = self._vote_plate(tid, plate if plate else '')
+                self.plates[tid] = plate_str
+            except Exception as e:
+                print(f"[OCR Final] Error en vehiculo #{tid}: {e}")
+                
+        self._ocr_running.discard(tid)
+
+        # Generar HTML de depuración únicamente una vez al final y solo si hubo placa válida
+        best_stages = self.best_plate_stages.get(tid)
+        if best_stages and plate_str and plate_str != '???':
+            self.plate_ocr.generate_debug_html(plate_str, best_stages)
+            
+        # Limpiar diccionarios temporales
+        self.best_plate_stages.pop(tid, None)
+        self.best_plate_width.pop(tid, None)
+
         # Registrar voto y obtener placa ganadora por votacion
-        plate_str = self._vote_plate(tid, plate if plate else '')
-        self.plates[tid] = plate_str
         ts = time.strftime("%H:%M:%S")
 
-        # Actualizar en el log de infracciones de la interfaz
+        # Actualizar log final
         for inf in self.infraction_log:
             if inf['id'] == tid and inf['plate'] == '...':
                 inf['plate'] = plate_str
@@ -427,12 +474,12 @@ class InteractiveSpeedTest:
         """Dibuja el panel de informacion en la esquina superior derecha."""
         h, w = frame.shape[:2]
 
-        # Fondo semitransparente
-        panel_x = w - 310
-        panel_h = 200 if self.video_path else 175
+        # Fondo semitransparente más oscuro para mejor contraste
+        panel_x = w - 360
+        panel_h = 210 if self.video_path else 185
         overlay = frame.copy()
-        cv2.rectangle(overlay, (panel_x - 6, 0), (w, panel_h), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        cv2.rectangle(overlay, (panel_x - 10, 0), (w, panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
 
         # Colores de estado
         ready_color = (0, 220, 0) if self.click_n == 2 else (0, 165, 255)
@@ -529,10 +576,10 @@ class InteractiveSpeedTest:
             over = speed is not None and speed > self.speed_limit_kmh
             color = (0, 0, 255) if over else (0, 220, 0)
             
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
             cv2.rectangle(frame, (cx - 4, cy - th - 12), (cx + tw + 4, cy - 2), (0, 0, 0), -1)
             cv2.putText(frame, label, (cx, cy - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
     def _draw_infraction_alert(self, frame):
         """
@@ -701,8 +748,8 @@ class InteractiveSpeedTest:
         cv2.resizeWindow(WINDOW_NAME, min(fw, 1280), min(fh, 720))
         cv2.setMouseCallback(WINDOW_NAME, self._mouse_callback)
 
-        # Delay entre frames para sincronizar con FPS del video
-        frame_delay_ms = int(1000 / fps) if self.video_path else 1
+        # Delay mínimo (1ms) para procesar el video a la máxima velocidad que permita la GPU/CPU
+        frame_delay_ms = 1
 
         # Inicializar variables para el bucle de pausa y refresco interactivo
         self._last_raw_frame = None
@@ -786,6 +833,19 @@ class InteractiveSpeedTest:
                             self._best_vehicle_snapshots[tid]['frame'] = frame.copy()
                             self._best_vehicle_snapshots[tid]['bbox'] = vehicle['bbox']
 
+                    # Votación periódica de OCR (Cooldown de 0.75s)
+                    current_time_ms = time.time()
+                    last_ocr = self._last_ocr_time.get(tid, 0)
+                    if current_time_ms - last_ocr >= 0.75 and not touches_border and tid not in self._ocr_running:
+                        self._last_ocr_time[tid] = current_time_ms
+                        self._ocr_running.add(tid)
+                        t = threading.Thread(
+                            target=self._run_ocr_vote_async,
+                            args=(tid, frame.copy(), vehicle['bbox']),
+                            daemon=True,
+                        )
+                        t.start()
+
                 # Calculo de velocidad por trayectoria y disparo de OCR en infracciones al salir
                 if self.speed_calc is not None and self.click_n == 2:
                     new_speeds = self.speed_calc.update(tracked_vehicles, current_time)
@@ -843,10 +903,28 @@ class InteractiveSpeedTest:
                                 t.start()
                         self._best_vehicle_snapshots.pop(tid, None)
 
-                # Limpiar snapshots de vehiculos normales que salieron (no cometieron infraccion)
+                # Procesar vehiculos normales que salieron (no cometieron infraccion) para generar OCR y HTML final
                 for tid in list(self._best_vehicle_snapshots.keys()):
                     if tid not in current_ids and tid not in self._infractions_to_process:
-                        self._best_vehicle_snapshots.pop(tid, None)
+                        snap = self._best_vehicle_snapshots.pop(tid, None)
+                        # Solo procesar si alcanzó a cruzar las líneas (tiene velocidad registrada)
+                        if snap is not None and tid in self.speeds:
+                            best_frame = snap.get('frame')
+                            best_bbox = snap.get('bbox')
+                            
+                            if best_frame is None and 'fallback' in snap:
+                                best_frame = snap['fallback']['frame']
+                                best_bbox = snap['fallback']['bbox']
+
+                            if best_frame is not None and self.plate_ocr is not None and tid not in self._ocr_running:
+                                self._ocr_running.add(tid)
+                                spd_val = self.speeds.get(tid, 0.0)
+                                t = threading.Thread(
+                                    target=self._run_ocr_async,
+                                    args=(tid, best_frame, best_bbox, spd_val),
+                                    daemon=True,
+                                )
+                                t.start()
             else:
                 # Si esta pausado, usar el ultimo frame e info guardados
                 if self._last_raw_frame is not None:

@@ -62,11 +62,12 @@ class VehicleTracker:
             conf=self.conf,
             iou=self.iou,
             verbose=False,
+            imgsz=480,    # Reducido de 640 a 480 para optimizar velocidad en tráfico cercano
             device=self.device,
         )
 
         tracked_vehicles = []
-        annotated_frame  = results[0].plot()
+        annotated_frame  = frame.copy()
 
         if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes       = results[0].boxes.xyxy.cpu().numpy()
@@ -79,6 +80,9 @@ class VehicleTracker:
                 x1, y1, x2, y2 = map(int, box)
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
+                
+                # Dibujar un recuadro blanco limpio en lugar de usar plot() de YOLO
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
 
                 tracked_vehicles.append({
                     'track_id':   int(track_id),
@@ -101,4 +105,4 @@ class VehicleTracker:
             numpy.ndarray: Frame anotado con todas las detecciones.
         """
         results = self.model.predict(frame, conf=self.conf, verbose=False, device=self.device)
-        return len(results[0].boxes), results[0].plot()
+        return len(results[0].boxes), frame.copy()

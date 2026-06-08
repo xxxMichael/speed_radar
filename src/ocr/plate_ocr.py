@@ -316,9 +316,10 @@ class PlateOCR:
             bbox (list): [x1, y1, x2, y2] del vehiculo en pixeles.
 
         Returns:
-            tuple[str, numpy.ndarray | None]:
+            tuple[str, numpy.ndarray | None, dict]:
                 - Texto de la placa (str). Puede ser vacio si no se detectaron caracteres.
                 - Imagen de debug de la segmentacion (puede ser None).
+                - Diccionario con las fases de segmentación.
         """
         x1, y1, x2, y2 = bbox
         fh, fw = frame.shape[:2]
@@ -334,13 +335,13 @@ class PlateOCR:
         # Localizar region de placa con YOLOv8 preentrenado (o fallback heuristico)
         plate_crop, _plate_bbox = self.plate_detector.find_plate(vehicle_crop)
         if plate_crop is None or plate_crop.size == 0:
-            return '', None
+            return '', None, {}
 
         # Segmentar caracteres
-        char_imgs, debug_img = self.segmenter.segment_characters(plate_crop)
+        char_imgs, debug_img, stages_dict = self.segmenter.segment_characters(plate_crop)
 
         if not char_imgs:
-            return '', debug_img
+            return '', debug_img, stages_dict
 
         # Clasificar cada caracter (con confianza)
         plate_chars = []
@@ -352,4 +353,57 @@ class PlateOCR:
         raw_str  = ''.join(plate_chars).upper()
         # Aplicar normalizacion de formato (placa ecuatoriana AAA-NNNN)
         plate_str = normalize_plate(raw_str)
-        return plate_str, debug_img
+            
+        return plate_str, debug_img, stages_dict
+
+    def generate_debug_html(self, plate_str: str, stages_dict: dict):
+        """Genera un archivo HTML con las imagenes en Base64 de las fases de segmentacion."""
+        import base64
+        import time
+        
+        html_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'debug_htmls')
+        os.makedirs(html_dir, exist_ok=True)
+        
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(html_dir, f"{plate_str}_{timestamp}.html")
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Debug OCR: {plate_str}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; background-color: #f4f4f9; padding: 20px; }}
+                h1 {{ color: #333; }}
+                .stage {{ background: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                .stage h3 {{ margin-top: 0; color: #0056b3; }}
+                img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
+            </style>
+        </head>
+        <body>
+            <h1>Reporte de Segmentación: {plate_str}</h1>
+            <p><strong>Fecha:</strong> {time.strftime("%d/%m/%Y %H:%M:%S")}</p>
+        """
+        
+        for name, img in stages_dict.items():
+            if img is not None and img.size > 0:
+                ret, buf = cv2.imencode('.png', img)
+                if ret:
+                    b64_str = base64.b64encode(buf).decode('utf-8')
+                    html_content += f"""
+            <div class="stage">
+                <h3>{name}</h3>
+                <img src="data:image/png;base64,{b64_str}" />
+            </div>
+                    """
+                    
+        html_content += """
+        </body>
+        </html>
+        """
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+        except Exception as e:
+            print(f"[OCR] Error al guardar HTML de depuración: {e}")

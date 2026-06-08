@@ -54,11 +54,11 @@ def main():
         plate_crop = img[int(h*0.7):, int(w*0.2):]
 
     segmenter = PlateSegmenter(target_size=(28, 28))
-    char_imgs, debug_img = segmenter.segment_characters(plate_crop)
+    char_imgs, debug_img, _ = segmenter.segment_characters(plate_crop)
 
     if not char_imgs:
         print("[WARN] No se detectaron caracteres en el ROI. Intentando en toda la imagen...")
-        char_imgs, debug_img = segmenter.segment_characters(img)
+        char_imgs, debug_img, _ = segmenter.segment_characters(img)
     
     if not char_imgs:
         print("[ERROR] OpenCV no pudo segmentar ningún carácter de la placa.")

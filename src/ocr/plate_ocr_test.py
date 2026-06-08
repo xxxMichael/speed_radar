@@ -135,7 +135,7 @@ class PlateOCRTest:
             plate_crop = roi_crop
 
         # --- Paso 2: Segmentacion de caracteres con OpenCV ---
-        char_imgs, debug_img = self.ocr.segmenter.segment_characters(plate_crop)
+        char_imgs, debug_img, _stages = self.ocr.segmenter.segment_characters(plate_crop)
         self.last_debug = debug_img
 
         if not char_imgs:

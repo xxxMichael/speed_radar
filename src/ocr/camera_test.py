@@ -43,7 +43,7 @@ def run_camera_ocr_test():
             display_frame = detector.draw_detection(display_frame, bbox)
             
             # Segmentar e inferir directamente del recorte de la placa para no repetir YOLO
-            char_imgs, debug_img = ocr.segmenter.segment_characters(plate_crop)
+            char_imgs, debug_img, _stages = ocr.segmenter.segment_characters(plate_crop)
             
             plate_str = ""
             avg_char_conf = 0.0

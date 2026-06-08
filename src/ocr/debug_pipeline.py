@@ -101,7 +101,7 @@ else:
 # ── 3. Segmentacion de caracteres ────────────────────────────────────────────
 print("\n[4] Segmentando caracteres...")
 segmenter = PlateSegmenter(target_size=(28, 28))
-char_imgs, debug_img = segmenter.segment_characters(plate_crop)
+char_imgs, debug_img, _stages = segmenter.segment_characters(plate_crop)
 print(f"   Caracteres segmentados: {len(char_imgs)}")
 
 # Mostrar la imagen binaria internamente

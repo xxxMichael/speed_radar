@@ -159,8 +159,8 @@ class InteractiveSpeedTest:
                 self.plate_crops[tid] = debug_img
                 
                 # Guardar el stages_dict solo si es la captura más cercana (imagen más ancha)
-                if stages_dict and "Gris Original" in stages_dict:
-                    current_width = stages_dict["Gris Original"].shape[1]
+                if stages_dict and "Gris + CLAHE" in stages_dict:
+                    current_width = stages_dict["Gris + CLAHE"].shape[1]
                     if current_width > self.best_plate_width.get(tid, 0):
                         self.best_plate_width[tid] = current_width
                         self.best_plate_stages[tid] = stages_dict
@@ -196,8 +196,8 @@ class InteractiveSpeedTest:
                         self.plate_crops = {}
                     self.plate_crops[tid] = debug_img
                     
-                    if stages_dict and "Gris Original" in stages_dict:
-                        current_width = stages_dict["Gris Original"].shape[1]
+                    if stages_dict and "Gris + CLAHE" in stages_dict:
+                        current_width = stages_dict["Gris + CLAHE"].shape[1]
                         if current_width > self.best_plate_width.get(tid, 0):
                             self.best_plate_width[tid] = current_width
                             self.best_plate_stages[tid] = stages_dict

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from ocr.plate_ocr import PlateOCR
+from ocr.plate_detector import PlateDetector
 
 
 # =============================================================================
@@ -35,8 +36,10 @@ from ocr.plate_ocr import PlateOCR
 CAMERA_INDEX    = 1             # DroidCam USB. Cambiar a 0 para webcam integrada.
 CAMERA_BACKEND  = cv2.CAP_DSHOW
 
-# Ruta al modelo CNN entrenado
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn.pth')
+# Ruta al modelo CNN entrenado (prioriza el modelo sintético si existe)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn_synthetic.pth')
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'char_cnn.pth')
 
 WINDOW_NAME      = "Test OCR de Placa  (Q=salir)"
 WINDOW_DEBUG     = "Debug - Segmentacion de Caracteres"
@@ -80,13 +83,22 @@ class PlateOCRTest:
         self.fps_display  = 0.0
         self.fps_timer    = time.time()
 
+        # Detector de posicion de placa con YOLOv8
+        self.plate_detector: PlateDetector | None = None   # Se inicializa en run()
+        # Ultimo bbox detectado de la placa RELATIVO al roi (para dibujarlo en pantalla)
+        self.last_plate_bbox_in_frame: list | None = None
+
     # ------------------------------------------------------------------
     # OCR sobre una region del frame
     # ------------------------------------------------------------------
 
     def _analyze_roi(self, frame: np.ndarray, roi_rect: tuple) -> str:
         """
-        Ejecuta el OCR sobre la region definida por roi_rect.
+        Ejecuta la deteccion de placa con YOLOv8/heuristico y el OCR sobre la region roi_rect.
+
+        1. Recorta el ROI del frame.
+        2. Usa PlateDetector para localizar la placa dentro del ROI.
+        3. Segmenta y clasifica los caracteres con la CNN OCR.
 
         Args:
             frame: Frame BGR completo.
@@ -95,20 +107,41 @@ class PlateOCRTest:
         Returns:
             str: Texto de la placa reconocida.
         """
-        x1, y1, x2, y2 = roi_rect
-        roi_crop = frame[y1:y2, x1:x2].copy()
+        rx1, ry1, rx2, ry2 = roi_rect
+        roi_crop = frame[ry1:ry2, rx1:rx2].copy()
 
         if roi_crop.size == 0:
             return ''
 
-        # Usar el segmentador directamente sobre el ROI
-        # (el ROI ya ES la placa — no necesitamos buscarla dentro de un bbox de vehiculo)
-        char_imgs, debug_img = self.ocr.segmenter.segment_characters(roi_crop)
+        # --- Paso 1: Detectar bbox exacto de la placa dentro del ROI ---
+        plate_crop = None
+        self.last_plate_bbox_in_frame = None
+
+        if self.plate_detector is not None:
+            result = self.plate_detector.find_plate(roi_crop)
+            plate_crop_det, plate_bbox_roi = result
+            if plate_crop_det is not None and plate_crop_det.size > 0:
+                plate_crop = plate_crop_det
+                # Convertir bbox relativo al ROI a coordenadas absolutas del frame
+                if plate_bbox_roi is not None:
+                    px1, py1, px2, py2 = plate_bbox_roi
+                    self.last_plate_bbox_in_frame = [
+                        rx1 + px1, ry1 + py1,
+                        rx1 + px2, ry1 + py2
+                    ]
+
+        # Si no se localizo placa, usar el ROI completo directamente
+        if plate_crop is None:
+            plate_crop = roi_crop
+
+        # --- Paso 2: Segmentacion de caracteres con OpenCV ---
+        char_imgs, debug_img = self.ocr.segmenter.segment_characters(plate_crop)
         self.last_debug = debug_img
 
         if not char_imgs:
             return ''
 
+        # --- Paso 3: Clasificacion CNN por caracter ---
         plate_chars = []
         for char_img in char_imgs:
             char, conf = self.ocr._classify_char(char_img)
@@ -266,7 +299,12 @@ class PlateOCRTest:
         # Cargar OCR
         print(f"[INFO] Cargando CNN OCR desde: {MODEL_PATH}")
         self.ocr = PlateOCR(model_path=MODEL_PATH)
-        print("[OK] OCR listo.\n")
+        print("[OK] OCR listo.")
+
+        # Cargar detector de placa (YOLOv8 fine-tuned)
+        print("[INFO] Iniciando detector de posicion de placa (YOLOv8)...")
+        self.plate_detector = PlateDetector(conf_threshold=0.25)
+        print("[OK] PlateDetector listo.\n")
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, min(fw, 1280), min(fh, 720))
@@ -301,6 +339,15 @@ class PlateOCRTest:
 
             # Dibujar
             self._draw_roi_box(frame, roi_rect, active=self.continuous)
+
+            # Dibujar bbox de la placa detectada por YOLOv8 (amarillo brillante)
+            if self.last_plate_bbox_in_frame is not None:
+                px1, py1, px2, py2 = self.last_plate_bbox_in_frame
+                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 220, 255), 2)
+                cv2.putText(frame, "PLACA DETECTADA",
+                            (px1, max(0, py1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2)
+
             self._draw_result(frame)
             self._draw_hud(frame)
 

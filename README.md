@@ -136,6 +136,34 @@ Tanto YOLOv8 (`ultralytics`) como el pipeline OCR (`PlateOCR`) detectan automát
 
 ---
 
+## 📧 Sistema de Notificaciones por Correo
+
+El sistema cuenta con un servicio automático y asíncrono para enviar notificaciones de infracción de tránsito por correo electrónico. Cuando un vehículo supera el límite de velocidad:
+1. El OCR lee la placa.
+2. El **Sistema Difuso Mamdani** calcula el monto de la multa ($).
+3. Se recorta un frame del vehículo infractor como evidencia visual.
+4. Se despacha un correo HTML en segundo plano con el reporte de infracción adjuntando la evidencia.
+
+### Configuración de Credenciales (`.env`)
+Para activar el envío de correos, crea o edita el archivo `.env` en la raíz del proyecto con las siguientes variables:
+```env
+# Configuración del servidor de correo saliente (SMTP)
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# Cuenta emisora (Remitente)
+SMTP_USER=tu_correo@gmail.com
+SMTP_PASSWORD=tu_contrasena_de_aplicacion  # Contraseña de aplicación de Google
+
+# Cuenta receptora (Destinatario)
+EMAIL_RECIPIENT=correo_destinatario@gmail.com
+```
+
+> [!IMPORTANT]
+> Si utilizas Gmail, debes habilitar la **Verificación en Dos Pasos** en tu cuenta de Google y generar una **Contraseña de Aplicación** (App Passwords) en la sección de Seguridad. No utilices la contraseña habitual de tu correo, ya que Google bloqueará la conexión directa.
+
+---
+
 ## 💻 Ejecución de los Scripts del Proyecto
 
 Una vez que tengas el entorno virtual listo y configurado con o sin CUDA, puedes lanzar los scripts de prueba utilizando el intérprete de Python del entorno virtual:
@@ -194,7 +222,7 @@ python src/ocr/plate_ocr_test.py
 
 ## 🚗 Script de Prueba: Radar de Infracciones (`detection_test.py`)
 
-Este es el script de **prueba integral**. Ejecuta el tracker YOLOv8 en paralelo y permite calibrar las líneas de radar interactivamente. Cuando un vehículo cruza ambas líneas, calcula su velocidad en tiempo real y, **en un hilo asíncrono para no trabar el video**, recorta la placa, ejecuta el OCR y evalúa la gravedad de la infracción en consola.
+Este es el script de **prueba integral**. Ejecuta el tracker YOLOv8 en paralelo y permite calibrar las líneas de radar interactivamente. Cuando un vehículo cruza ambas líneas, calcula su velocidad en tiempo real y, **en un hilo asíncrono para no trabar el video**, recorta la placa, ejecuta el OCR, determina el valor de la multa por medio del sistema de control de inferencia difuso y despacha el correo de alerta de manera simultánea.
 
 ### Cómo ejecutarlo
 Desde la terminal con el entorno virtual activo:
@@ -213,13 +241,15 @@ python src/detection/detection_test.py
 5. **Modo Diagnóstico (`D`)**: Muestra todas las detecciones de YOLO, no solo vehículos (muy útil para depurar si YOLO no detecta algún objeto).
 
 ### Salida de Datos en Consola (Consola de Infracciones)
-Cuando el vehículo cruza la segunda línea, el sistema lanza el OCR asíncrono. Al finalizar, imprime en consola de acuerdo al estado de velocidad:
+Cuando el vehículo cruza la segunda línea y es analizado por el OCR y el sistema difuso, se imprimen los registros:
 
 ```bash
-# Caso 1: Vehículo supera el límite de velocidad (Genera una alerta roja y registra infracción)
-[INFRACCION] 13:45:12 | Vehiculo #4 | Placa: ABC123 | Velocidad: 45.8 km/h
+# Caso 1: Vehículo supera el límite de velocidad (Genera multa difusa y dispara correo electrónico)
+[INFRACCION] 13:45:12 | Vehiculo #4 | Placa: ABC123 | Velocidad: 45.8 km/h | Multa Difusa: $185.34 USD
+[SMTP] Iniciando envío de correo de alerta para Vehículo #4...
+[SMTP] Correo enviado exitosamente para el vehiculo #4 (Placa: ABC123, Multa: $185.34)
 
-# Caso 2: Vehículo transita a velocidad permitida (Solo registra la placa de manera informativa)
+# Caso 2: Vehículo transita a velocidad permitida (Solo registra de forma informativa, sin multa ni correo)
 [REGISTRO]   13:45:18 | Vehiculo #5 | Placa: XYZ789
 ```
 

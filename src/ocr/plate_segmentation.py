@@ -41,22 +41,35 @@ class PlateSegmenter:
         # 2. Convertir a escala de grises
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
 
-        # 3. CLAHE: mejora local del contraste (critico para placas con iluminacion desigual)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # 3. CLAHE: mejora local del contraste (critico para placas con iluminacion desigual).
+        # clipLimit moderado (2.0): un valor alto amplifica el ruido del sensor del celular
+        # y lo convierte en "motas" que ensucian la binarizacion ("filtros raros").
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray  = clahe.apply(gray)
 
-        # 4. Suavizado ligero (Bilateral filter reduce ruido pero preserva bordes)
-        blur = cv2.bilateralFilter(gray, 11, 17, 17)
+        # 4. Suavizado que preserva bordes. Bilateral mas ligero (d=7) = menos ruido y mas rapido.
+        blur = cv2.bilateralFilter(gray, 7, 50, 50)
 
-        # 5. Binarizacion adaptativa: ideal para fondos con contraste pobre (placas naranja/amarillo) o luces.
-        # Bloque de 15, constante C de 6 funciona bien para texto, manteniendo trazos finos y gruesos.
-        binary_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 6)
-        binary_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 6)
+        # 5. Tres estrategias de binarizacion; mas abajo se elige la mas plausible.
+        #    - Otsu invertido: limpio cuando la placa esta bien recortada y con buen contraste.
+        #    - Adaptativo invertido: robusto a iluminacion desigual (sombras, reflejos).
+        #    - Adaptativo normal: para placas con texto claro sobre fondo oscuro.
+        _, otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        adap_inv = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 6)
+        adap_nor = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 6)
 
-        # Operacion morfologica: cierre un poco mas alto para unir caracteres partidos por tornillos
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
-        binary_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_CLOSE, kernel)
-        binary_nor = cv2.morphologyEx(binary_nor, cv2.MORPH_CLOSE, kernel)
+        # Limpieza: apertura (quita motas/ruido = los "filtros raros") + cierre (une trazos partidos).
+        open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+
+        def _clean(b):
+            b = cv2.morphologyEx(b, cv2.MORPH_OPEN,  open_k)   # elimina motas pequenas
+            b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, close_k)  # une caracteres partidos por tornillos
+            return b
+
+        otsu_inv = _clean(otsu_inv)
+        adap_inv = _clean(adap_inv)
+        adap_nor = _clean(adap_nor)
 
         def _extract_contours(binary):
             """Retorna lista de (x, y, w, h) de caracteres validos, filtrando bordes e interiores."""
@@ -115,16 +128,22 @@ class PlateSegmenter:
                     
             return filtered_valid
 
-        valid_inv = _extract_contours(binary_inv)
-        valid_nor = _extract_contours(binary_nor)
+        variants     = [otsu_inv, adap_inv, adap_nor]
+        contour_sets = [_extract_contours(v) for v in variants]
 
-        # Usar la binarizacion que produjo mas caracteres plausibles
-        if len(valid_inv) >= len(valid_nor):
-            binary        = binary_inv
-            valid_contours = valid_inv
-        else:
-            binary        = binary_nor
-            valid_contours = valid_nor
+        # Elegir la binarizacion cuyo numero de caracteres sea MAS PLAUSIBLE para una placa.
+        # Antes se elegia "la que tenga mas contornos", lo que premiaba a la binarizacion
+        # mas ruidosa (mas falsos caracteres). Una placa tipica tiene 6-7 caracteres, asi que
+        # puntuamos por cercania a 7 y penalizamos el exceso (ruido).
+        def _plausibility(boxes):
+            n = len(boxes)
+            if n == 0:
+                return -100
+            return -abs(n - 7)
+
+        best_i = max(range(len(variants)), key=lambda i: _plausibility(contour_sets[i]))
+        binary         = variants[best_i]
+        valid_contours = contour_sets[best_i]
 
         # Ordenar de izquierda a derecha
         valid_contours = sorted(valid_contours, key=lambda b: b[0])
@@ -155,9 +174,9 @@ class PlateSegmenter:
             char_crops.append(char_resized)
 
         stages_dict = {
-            "Gris Original": gray,
+            "Gris + CLAHE": gray,
             "Filtro Bilateral": blur,
-            "Binarización Adaptativa": binary,
+            "Binarización (mejor variante)": binary,
             "Segmentación Final": debug_img
         }
 

@@ -1,0 +1,11 @@
+data/
+venv/
+.venv/
+env/
+.env/
+videos/
+__pycache__/
+*.py[cod]
+*$py.class
+scratch/
+.env

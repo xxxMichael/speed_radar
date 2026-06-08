@@ -99,6 +99,7 @@ class InteractiveSpeedTest:
 
         # Estado de diagnostico
         self.diag_mode      = False
+        self.show_hud       = True
         self.detected_count = 0
 
         # Metricas de FPS
@@ -406,6 +407,10 @@ class InteractiveSpeedTest:
         elif key == ord('r'):                   # R: resetear
             self._reset_lines()
 
+        elif key == ord('h'):                   # H: ocultar/mostrar HUD
+            self.show_hud = not self.show_hud
+            print(f"[INFO] HUD: {'ON' if self.show_hud else 'OFF'}")
+
         elif key == ord('+') or key == ord('='):    # +: mas distancia
             self.real_distance_m = round(self.real_distance_m + REAL_DISTANCE_STEP, 1)
             print(f"[INFO] Distancia real: {self.real_distance_m} m")
@@ -476,10 +481,13 @@ class InteractiveSpeedTest:
 
     def _draw_hud(self, frame):
         """Dibuja el panel de informacion en la esquina superior derecha."""
+        if not self.show_hud:
+            return
+
         h, w = frame.shape[:2]
 
         # Fondo semitransparente más oscuro para mejor contraste
-        panel_x = w - 360
+        panel_x = w - 180
         panel_h = 210 if self.video_path else 185
         overlay = frame.copy()
         cv2.rectangle(overlay, (panel_x - 10, 0), (w, panel_h), (0, 0, 0), -1)
@@ -541,7 +549,7 @@ class InteractiveSpeedTest:
                     (panel_x, row), cv2.FONT_HERSHEY_SIMPLEX, 0.50, diag_color, 1)
         row += step
 
-        controls = "[R] Reset   [S] Screenshot   [Q] Salir"
+        controls = "[R] Reset   [S] Screenshot   [H] HUD   [Q] Salir"
         if self.video_path:
             controls = "[SPC] Pausa  " + controls
         cv2.putText(frame, controls,
@@ -837,11 +845,8 @@ class InteractiveSpeedTest:
                             self._best_vehicle_snapshots[tid]['frame'] = frame.copy()
                             self._best_vehicle_snapshots[tid]['bbox'] = vehicle['bbox']
 
-                    # Votación periódica de OCR (Cooldown de 0.75s)
-                    current_time_ms = time.time()
-                    last_ocr = self._last_ocr_time.get(tid, 0)
-                    if current_time_ms - last_ocr >= 0.75 and not touches_border and tid not in self._ocr_running:
-                        self._last_ocr_time[tid] = current_time_ms
+                    # Votación periódica de OCR (Sin cooldown)
+                    if not touches_border and tid not in self._ocr_running:
                         self._ocr_running.add(tid)
                         t = threading.Thread(
                             target=self._run_ocr_vote_async,

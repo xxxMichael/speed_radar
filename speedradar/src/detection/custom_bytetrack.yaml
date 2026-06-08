@@ -1,0 +1,8 @@
+# Custom ByteTrack settings for noisy/screen-recording environments
+tracker_type: bytetrack
+track_high_thresh: 0.25      # Threshold for first association (default: 0.5)
+track_low_thresh: 0.05       # Threshold for second association (default: 0.1)
+new_track_thresh: 0.25       # Minimum confidence to start a track (default: 0.6)
+track_buffer: 90             # Keep track for 90 frames (3 seconds) if lost (default: 30)
+match_thresh: 0.9            # IoU distance threshold (1 - IoU). (default: 0.8)
+fuse_score: True             # Required parameter for newer ultralytics versions
